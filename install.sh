@@ -66,14 +66,14 @@ rand_hex() {
 
 prompt_inputs() {
   log "Configuration"
-
-  read -rp "Domain (e.g. waypoint.school.edu.au): " CADDY_DOMAIN
+[[ -t 0 ]] || exec </dev/tty
+  read -rp "Domain (e.g. waypoint.school.edu.au): " CADDY_DOMAIN 
   if [[ -z "${CADDY_DOMAIN}" ]]; then
     echo "Domain is required."
     exit 1
   fi
 
-  read -rp "Email for Let's Encrypt (e.g. it@school.edu.au): " CADDY_EMAIL
+  read -rp "Email for Let's Encrypt (e.g. it@school.edu.au): " CADDY_EMAIL 
   if [[ -z "${CADDY_EMAIL}" ]]; then
     echo "Email is required."
     exit 1
@@ -86,8 +86,7 @@ prompt_inputs() {
   DB_PASSWORD="$(rand_hex)"
   MYSQL_ROOT_PASSWORD="$(rand_hex)"
 
-  # Generate Laravel APP_KEY inside the container after pull, but we can pre-generate too.
-  # We'll generate it container-side to avoid requiring PHP on host.
+  
   APP_KEY=""
 
   WAYPOINT_APP_IMAGE="ghcr.io/waypointeducation/waypoint:stable"
@@ -109,7 +108,7 @@ prompt_inputs() {
 write_templates() {
   log "Writing stack files"
 
-  # Always fetch templates from GitHub so curl|bash works
+  
   BASE_URL="https://raw.githubusercontent.com/WaypointEducation/waypoint-installer/main/templates"
 
   curl -fsSL "${BASE_URL}/compose.yml" -o "${STACK_DIR}/compose.yml"
@@ -146,7 +145,7 @@ EOF
 }
 
 set_storage_perms() {
-  # Debian www-data is 33:33; container also typically uses 33
+
   log "Setting storage permissions for container writes"
   chown -R 33:33 "${DATA_DIR}/storage" || true
   chmod -R 775 "${DATA_DIR}/storage" || true
@@ -164,7 +163,7 @@ generate_app_key_in_container() {
 
   cd "${STACK_DIR}"
 
-  # Generate key using container PHP (no host PHP required)
+  # Generate key using container PHP 
   KEY="$(docker compose exec -T waypoint-app php -r "echo 'base64:'.base64_encode(random_bytes(32)).PHP_EOL;")"
   if [[ -z "${KEY}" ]]; then
     echo "Failed to generate APP_KEY."
