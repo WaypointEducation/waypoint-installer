@@ -1,0 +1,13 @@
+{$CADDY_DOMAIN} {
+    encode zstd gzip
+
+    root * /var/www/html/public
+    php_fastcgi waypoint-app:9000
+    file_server
+
+    header {
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+}

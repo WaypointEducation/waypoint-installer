@@ -1,0 +1,99 @@
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      CADDY_EMAIL: ${CADDY_EMAIL}
+      CADDY_DOMAIN: ${CADDY_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - waypoint-app
+
+  waypoint-app:
+    image: ${WAYPOINT_APP_IMAGE}
+    restart: unless-stopped
+    environment: &waypoint_env
+      APP_ENV: ${APP_ENV}
+      APP_DEBUG: ${APP_DEBUG}
+      APP_URL: ${APP_URL}
+      APP_KEY: ${APP_KEY}
+
+      DB_CONNECTION: ${DB_CONNECTION}
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_DATABASE: ${DB_DATABASE}
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+
+      CACHE_DRIVER: ${CACHE_DRIVER}
+      QUEUE_CONNECTION: ${QUEUE_CONNECTION}
+      SESSION_DRIVER: ${SESSION_DRIVER}
+    volumes:
+      - /opt/waypoint/data/storage:/var/www/html/storage
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  waypoint-queue:
+    image: ${WAYPOINT_APP_IMAGE}
+    restart: unless-stopped
+    environment: *waypoint_env
+    volumes:
+      - /opt/waypoint/data/storage:/var/www/html/storage
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: ["php", "artisan", "queue:work", "--sleep=1", "--tries=3", "--timeout=120"]
+
+  waypoint-scheduler:
+    image: ${WAYPOINT_APP_IMAGE}
+    restart: unless-stopped
+    environment: *waypoint_env
+    volumes:
+      - /opt/waypoint/data/storage:/var/www/html/storage
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: ["/bin/sh", "-lc", "while true; do php artisan schedule:run --no-interaction; sleep 60; done"]
+
+  mariadb:
+    image: mariadb:11
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${DB_DATABASE}
+      MARIADB_USER: ${DB_USERNAME}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - /opt/waypoint/data/mariadb:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - /opt/waypoint/data/redis:/data
+
+volumes:
+  caddy_data:
+  caddy_config:
