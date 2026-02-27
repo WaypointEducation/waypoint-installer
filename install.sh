@@ -109,18 +109,11 @@ prompt_inputs() {
 write_templates() {
   log "Writing stack files"
 
-  # Copy templates bundled beside this script (works when curl|bash pipes it to /tmp too)
-  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # Always fetch templates from GitHub so curl|bash works
+  BASE_URL="https://raw.githubusercontent.com/WaypointEducation/waypoint-installer/main/templates"
 
-  # If running via curl|bash, templates won't exist locally unless we download them.
-  # For now: this installer expects to be run from a cloned repo directory.
-  if [[ ! -d "${SCRIPT_DIR}/templates" ]]; then
-    echo "templates/ directory not found. Run from the cloned waypoint-installer repo."
-    exit 1
-  fi
-
-  cp "${SCRIPT_DIR}/templates/compose.yml" "${STACK_DIR}/compose.yml"
-  cp "${SCRIPT_DIR}/templates/Caddyfile" "${STACK_DIR}/Caddyfile"
+  curl -fsSL "${BASE_URL}/compose.yml" -o "${STACK_DIR}/compose.yml"
+  curl -fsSL "${BASE_URL}/Caddyfile" -o "${STACK_DIR}/Caddyfile"
 
   cat > "${STACK_DIR}/.env" <<EOF
 WAYPOINT_APP_IMAGE=${WAYPOINT_APP_IMAGE}
