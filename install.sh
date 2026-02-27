@@ -4,30 +4,57 @@ set -euo pipefail
 STACK_DIR="/opt/waypoint/stack"
 DATA_DIR="/opt/waypoint/data"
 
+# -----------------------------
+# helpers
+# -----------------------------
 log() { echo -e "\n[waypoint-installer] $*\n"; }
+die() { echo -e "\n[waypoint-installer] ERROR: $*\n" >&2; exit 1; }
 
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
-    echo "Please run as root (or via sudo): sudo bash install.sh"
-    exit 1
+    die "Please run as root (or via sudo): sudo bash install.sh"
   fi
 }
 
 ensure_debian() {
   if [[ ! -f /etc/debian_version ]]; then
-    echo "This installer currently supports Debian-based systems only."
-    exit 1
+    die "This installer currently supports Debian-based systems only."
   fi
 }
 
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+rand_b64() { openssl rand -base64 32 | tr -d '\n'; }
+rand_hex() { openssl rand -hex 24 | tr -d '\n'; }
+
+confirm() {
+  local prompt="${1:-Are you sure?}"
+  local ans
+  read -rp "${prompt} [y/N]: " ans
+  [[ "${ans}" =~ ^[Yy]$ ]]
+}
+
+is_domain_like() {
+  # light validation (not perfect, but catches empty/space)
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$1" == *.* ]]
+}
+
+dns_resolves() {
+  local host="$1"
+  getent ahosts "$host" >/dev/null 2>&1
+}
+
+# -----------------------------
+# install deps
+# -----------------------------
 install_prereqs() {
   log "Installing prerequisites"
   apt-get update -y
-  apt-get install -y ca-certificates curl gnupg openssl
+  apt-get install -y ca-certificates curl gnupg openssl git
 }
 
 install_docker() {
-  if command -v docker >/dev/null 2>&1; then
+  if command_exists docker; then
     log "Docker already installed"
     return
   fi
@@ -47,6 +74,14 @@ install_docker() {
   apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 }
 
+ensure_compose() {
+  # docker compose (plugin) should exist after docker-compose-plugin install
+  if docker compose version >/dev/null 2>&1; then
+    return
+  fi
+  die "'docker compose' is not available. Install docker-compose-plugin (or reinstall Docker)."
+}
+
 ensure_dirs() {
   log "Creating directories under /opt/waypoint"
   mkdir -p "${STACK_DIR}"
@@ -55,39 +90,116 @@ ensure_dirs() {
   mkdir -p "${DATA_DIR}/storage"/framework/{cache,sessions,views}
 }
 
-rand_b64() {
-  # 32 bytes => base64 string
-  openssl rand -base64 32 | tr -d '\n'
+set_storage_perms() {
+  # Debian www-data is 33:33; our container runs as www-data too
+  log "Setting storage permissions for container writes"
+  chown -R 33:33 "${DATA_DIR}/storage" || true
+  chmod -R ug+rwX "${DATA_DIR}/storage" || true
 }
 
-rand_hex() {
-  openssl rand -hex 24 | tr -d '\n'
-}
-
+# -----------------------------
+# config / prompts
+# -----------------------------
 prompt_inputs() {
-  log "Configuration"
-[[ -t 0 ]] || exec </dev/tty
-  read -rp "Domain (e.g. waypoint.school.edu.au): " CADDY_DOMAIN 
-  if [[ -z "${CADDY_DOMAIN}" ]]; then
-    echo "Domain is required."
-    exit 1
+  clear || true
+
+  cat <<'BANNER'
+============================================================
+                 Welcome to Waypoint Education Installer
+============================================================
+This will install the Waypoint Education stack to:
+
+  /opt/waypoint/stack   (compose.yml, .env, Caddyfile)
+  /opt/waypoint/data    (MariaDB, Redis, app storage)
+
+Components:
+  - Waypoint App (ghcr.io/waypointeducation/waypoint:stable)
+  - MariaDB
+  - Redis
+  - Caddy (reverse proxy)
+
+You will be asked for:
+  - Domain
+  - TLS mode (Let's Encrypt / Internal TLS / HTTP)
+  - Database credentials (auto-generate or custom)
+============================================================
+
+BANNER
+
+  # Domain
+  read -rp "Domain (e.g. waypoint.school.edu.au): " CADDY_DOMAIN
+  [[ -n "${CADDY_DOMAIN}" ]] || die "Domain is required."
+  is_domain_like "${CADDY_DOMAIN}" || die "Domain looks invalid: ${CADDY_DOMAIN}"
+
+  # TLS mode
+  echo
+  echo "TLS mode:"
+  echo "  1) Let's Encrypt (production)  - requires public DNS + ports 80/443 reachable"
+  echo "  2) Internal TLS (local)        - self-signed by Caddy (browser will warn)"
+  echo "  3) HTTP only (local)           - no TLS"
+  echo
+  read -rp "Choose TLS mode [1/2/3] (default 2): " TLS_CHOICE
+  TLS_CHOICE="${TLS_CHOICE:-2}"
+
+  case "${TLS_CHOICE}" in
+    1)
+      TLS_MODE="letsencrypt"
+      read -rp "Email for Let's Encrypt (e.g. it@school.edu.au): " CADDY_EMAIL
+      [[ -n "${CADDY_EMAIL}" ]] || die "Email is required for Let's Encrypt."
+      ;;
+    2)
+      TLS_MODE="internal"
+      CADDY_EMAIL=""
+      ;;
+    3)
+      TLS_MODE="http"
+      CADDY_EMAIL=""
+      ;;
+    *)
+      die "Invalid TLS mode choice: ${TLS_CHOICE}"
+      ;;
+  esac
+
+  # If Let's Encrypt, validate DNS resolves publicly (hosts file doesn't count)
+  if [[ "${TLS_MODE}" == "letsencrypt" ]]; then
+    echo
+    echo "Checking public DNS for ${CADDY_DOMAIN}..."
+    if ! dns_resolves "${CADDY_DOMAIN}"; then
+      die "Public DNS does not resolve for ${CADDY_DOMAIN}. For local testing, choose Internal TLS or HTTP."
+    fi
   fi
 
-  read -rp "Email for Let's Encrypt (e.g. it@school.edu.au): " CADDY_EMAIL 
-  if [[ -z "${CADDY_EMAIL}" ]]; then
-    echo "Email is required."
-    exit 1
+  # App URL based on TLS mode
+  if [[ "${TLS_MODE}" == "http" ]]; then
+    APP_URL="http://${CADDY_DOMAIN}"
+  else
+    APP_URL="https://${CADDY_DOMAIN}"
   fi
 
-  APP_URL="https://${CADDY_DOMAIN}"
+  # Database creds
+  echo
+  echo "Database credentials:"
+  echo "  A) Auto-generate secure credentials (recommended)"
+  echo "  B) I will provide DB username/password"
+  echo
+  read -rp "Choose [A/B] (default A): " DB_CHOICE
+  DB_CHOICE="${DB_CHOICE:-A}"
 
   DB_DATABASE="waypoint"
-  DB_USERNAME="waypoint"
-  DB_PASSWORD="$(rand_hex)"
-  MYSQL_ROOT_PASSWORD="$(rand_hex)"
 
-  
-  APP_KEY=""
+  if [[ "${DB_CHOICE}" =~ ^[Bb]$ ]]; then
+    read -rp "DB username: " DB_USERNAME
+    [[ -n "${DB_USERNAME}" ]] || die "DB username is required."
+
+    read -rsp "DB password (will not echo): " DB_PASSWORD
+    echo
+    [[ -n "${DB_PASSWORD}" ]] || die "DB password is required."
+  else
+    DB_USERNAME="waypoint"
+    DB_PASSWORD="$(rand_hex)"
+  fi
+
+  MYSQL_ROOT_PASSWORD="$(rand_hex)"
 
   WAYPOINT_APP_IMAGE="ghcr.io/waypointeducation/waypoint:stable"
   APP_ENV="production"
@@ -103,17 +215,162 @@ prompt_inputs() {
   CACHE_DRIVER="redis"
   QUEUE_CONNECTION="redis"
   SESSION_DRIVER="redis"
+
+  # We'll generate APP_KEY inside the container after it's up
+  APP_KEY=""
 }
 
-write_templates() {
+show_plan_and_confirm() {
+  echo
+  echo "------------------------------------------------------------"
+  echo "Review configuration"
+  echo "------------------------------------------------------------"
+  echo "Domain:          ${CADDY_DOMAIN}"
+  echo "TLS mode:        ${TLS_MODE}"
+  [[ "${TLS_MODE}" == "letsencrypt" ]] && echo "ACME email:       ${CADDY_EMAIL}"
+  echo "App URL:         ${APP_URL}"
+  echo
+  echo "DB database:     ${DB_DATABASE}"
+  echo "DB username:     ${DB_USERNAME}"
+  echo "DB password:     (hidden)"
+  echo
+  echo "Install paths:"
+  echo "  Stack:         ${STACK_DIR}"
+  echo "  Data:          ${DATA_DIR}"
+  echo
+  echo "Image:"
+  echo "  Waypoint:      ${WAYPOINT_APP_IMAGE}"
+  echo "------------------------------------------------------------"
+  echo
+
+  confirm "Proceed with installation?" || die "Cancelled by user."
+}
+
+# -----------------------------
+# write stack files (inline)
+# -----------------------------
+write_stack_files() {
   log "Writing stack files"
 
-  
-  BASE_URL="https://raw.githubusercontent.com/WaypointEducation/waypoint-installer/main/templates"
+  # compose.yml
+  cat > "${STACK_DIR}/compose.yml" <<'YAML'
+services:
+  waypoint-app:
+    image: ${WAYPOINT_APP_IMAGE}
+    env_file:
+      - .env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - /opt/waypoint/data/storage:/var/www/html/storage
+    restart: unless-stopped
 
-  curl -fsSL "${BASE_URL}/compose.yml" -o "${STACK_DIR}/compose.yml"
-  curl -fsSL "${BASE_URL}/Caddyfile" -o "${STACK_DIR}/Caddyfile"
+  waypoint-queue:
+    image: ${WAYPOINT_APP_IMAGE}
+    env_file:
+      - .env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - /opt/waypoint/data/storage:/var/www/html/storage
+    command: ["php", "artisan", "queue:work", "--sleep=1", "--tries=1"]
+    restart: unless-stopped
 
+  waypoint-scheduler:
+    image: ${WAYPOINT_APP_IMAGE}
+    env_file:
+      - .env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - /opt/waypoint/data/storage:/var/www/html/storage
+    command: ["sh", "-lc", "while true; do php artisan schedule:run --no-interaction; sleep 60; done"]
+    restart: unless-stopped
+
+  mariadb:
+    image: mariadb:11
+    environment:
+      MARIADB_DATABASE: ${DB_DATABASE}
+      MARIADB_USER: ${DB_USERNAME}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - /opt/waypoint/data/mariadb:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -p$${MARIADB_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - /opt/waypoint/data/redis:/data
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      CADDY_EMAIL: ${CADDY_EMAIL}
+      CADDY_DOMAIN: ${CADDY_DOMAIN}
+      TLS_MODE: ${TLS_MODE}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - waypoint-app
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
+YAML
+
+  # Caddyfile (supports 3 modes via TLS_MODE)
+  cat > "${STACK_DIR}/Caddyfile" <<'CADDY'
+{
+  email {$CADDY_EMAIL}
+}
+
+{$CADDY_DOMAIN} {
+  @httpOnly expression `{env.TLS_MODE} == "http"`
+  @internalTls expression `{env.TLS_MODE} == "internal"`
+  @letsEncrypt expression `{env.TLS_MODE} == "letsencrypt"`
+
+  # HTTP-only mode
+  handle @httpOnly {
+    tls off
+    reverse_proxy waypoint-app:9000
+  }
+
+  # Internal TLS mode (self-signed)
+  handle @internalTls {
+    tls internal
+    reverse_proxy waypoint-app:9000
+  }
+
+  # Let's Encrypt mode (default HTTPS / automatic)
+  handle @letsEncrypt {
+    reverse_proxy waypoint-app:9000
+  }
+}
+CADDY
+
+  # .env
   cat > "${STACK_DIR}/.env" <<EOF
 WAYPOINT_APP_IMAGE=${WAYPOINT_APP_IMAGE}
 
@@ -139,18 +396,15 @@ SESSION_DRIVER=${SESSION_DRIVER}
 
 CADDY_EMAIL=${CADDY_EMAIL}
 CADDY_DOMAIN=${CADDY_DOMAIN}
+TLS_MODE=${TLS_MODE}
 EOF
 
   chmod 600 "${STACK_DIR}/.env"
 }
 
-set_storage_perms() {
-
-  log "Setting storage permissions for container writes"
-  chown -R 33:33 "${DATA_DIR}/storage" || true
-  chmod -R 775 "${DATA_DIR}/storage" || true
-}
-
+# -----------------------------
+# bring up stack + app init
+# -----------------------------
 compose_up() {
   log "Starting services"
   cd "${STACK_DIR}"
@@ -163,17 +417,10 @@ generate_app_key_in_container() {
 
   cd "${STACK_DIR}"
 
-  # Generate key using container PHP 
   KEY="$(docker compose exec -T waypoint-app php -r "echo 'base64:'.base64_encode(random_bytes(32)).PHP_EOL;")"
-  if [[ -z "${KEY}" ]]; then
-    echo "Failed to generate APP_KEY."
-    exit 1
-  fi
+  [[ -n "${KEY}" ]] || die "Failed to generate APP_KEY."
 
-  # Replace APP_KEY= line in host .env
   sed -i "s|^APP_KEY=.*$|APP_KEY=${KEY}|" "${STACK_DIR}/.env"
-
-  # Restart to load env
   docker compose up -d
 }
 
@@ -192,9 +439,20 @@ print_summary() {
   echo "DB_PASSWORD=${DB_PASSWORD}"
   echo
   echo "Next:"
-  echo "  - Browse to the URL above"
-  echo "  - If you have an internal 'first admin' command, run it with:"
-  echo "      cd ${STACK_DIR} && docker compose exec waypoint-app php artisan <your-command>"
+  echo "  1) Browse to the URL above"
+  echo "  2) Run any admin/bootstrap commands like:"
+  echo "     cd ${STACK_DIR} && docker compose exec waypoint-app php artisan <command>"
+  echo
+  if [[ "${TLS_MODE}" == "internal" ]]; then
+    echo "Note (Internal TLS):"
+    echo "  Your browser will warn until you trust Caddy's local CA."
+    echo "  For quick testing you can proceed through the warning."
+    echo
+  elif [[ "${TLS_MODE}" == "http" ]]; then
+    echo "Note (HTTP):"
+    echo "  This is plaintext HTTP. Use Let's Encrypt mode for production."
+    echo
+  fi
 }
 
 main() {
@@ -202,9 +460,13 @@ main() {
   ensure_debian
   install_prereqs
   install_docker
+  ensure_compose
   ensure_dirs
+
   prompt_inputs
-  write_templates
+  show_plan_and_confirm
+
+  write_stack_files
   set_storage_perms
   compose_up
   generate_app_key_in_container
