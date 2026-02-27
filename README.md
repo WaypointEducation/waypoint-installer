@@ -2,7 +2,7 @@
 
 Installs the Waypoint appliance stack on Debian using Docker + Caddy + MariaDB + Redis.
 
-## Install (from cloned repo)
+## Install
 
 ```bash
-sudo bash install.sh
+curl -fsSL https://raw.githubusercontent.com/WaypointEducation/waypoint-installer/main/install.sh | sudo bash
