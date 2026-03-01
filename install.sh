@@ -24,7 +24,6 @@ ensure_debian() {
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-rand_b64() { openssl rand -base64 32 | tr -d '\n'; }
 rand_hex() { openssl rand -hex 24 | tr -d '\n'; }
 
 confirm() {
@@ -37,6 +36,11 @@ confirm() {
 is_domain_like() {
   # light validation (not perfect, but catches empty/space)
   [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$1" == *.* ]]
+}
+
+is_slug_like() {
+  # tenant id / subdomain style: letters, numbers, hyphen
+  [[ "$1" =~ ^[a-z0-9]+([a-z0-9-]*[a-z0-9])?$ ]]
 }
 
 dns_resolves() {
@@ -75,13 +79,15 @@ install_docker() {
 }
 
 ensure_compose() {
-  # docker compose (plugin) should exist after docker-compose-plugin install
   if docker compose version >/dev/null 2>&1; then
     return
   fi
   die "'docker compose' is not available. Install docker-compose-plugin (or reinstall Docker)."
 }
 
+# -----------------------------
+# filesystem prep
+# -----------------------------
 ensure_dirs() {
   log "Creating directories under /opt/waypoint"
   mkdir -p "${STACK_DIR}"
@@ -91,10 +97,20 @@ ensure_dirs() {
 }
 
 set_storage_perms() {
-  # Debian www-data is 33:33; our container runs as www-data too
+  # Debian www-data is 33:33; container runs as www-data too
   log "Setting storage permissions for container writes"
   chown -R 33:33 "${DATA_DIR}/storage" || true
   chmod -R ug+rwX "${DATA_DIR}/storage" || true
+}
+
+maybe_overwrite_existing_stack() {
+  if [[ -f "${STACK_DIR}/compose.yml" || -f "${STACK_DIR}/.env" || -f "${STACK_DIR}/Caddyfile" ]]; then
+    echo
+    echo "Existing stack files detected in ${STACK_DIR}:"
+    ls -la "${STACK_DIR}" | sed -n '1,120p' || true
+    echo
+    confirm "Overwrite existing stack files in ${STACK_DIR}?" || die "Cancelled by user."
+  fi
 }
 
 # -----------------------------
@@ -105,7 +121,7 @@ prompt_inputs() {
 
   cat <<'BANNER'
 ============================================================
-                 Welcome to Waypoint Education Installer
+               Welcome to Waypoint Education Installer
 ============================================================
 This will install the Waypoint Education stack to:
 
@@ -113,26 +129,50 @@ This will install the Waypoint Education stack to:
   /opt/waypoint/data    (MariaDB, Redis, app storage)
 
 Components:
-  - Waypoint App (ghcr.io/waypointeducation/waypoint:stable)
+  - Waypoint Education app (ghcr.io/waypointeducation/waypoint:stable)
   - MariaDB
   - Redis
   - Caddy (reverse proxy)
 
 You will be asked for:
-  - Domain
+  - Tenant details (tenant id, name, subdomain, base domain)
   - TLS mode (Let's Encrypt / Internal TLS / HTTP)
   - Database credentials (auto-generate or custom)
+
+Notes:
+  - Waypoint is tenant-first. This installer will create your first tenant
+    and map it to: <subdomain>.<base-domain>
 ============================================================
 
 BANNER
 
-  # Domain
-  read -rp "Domain (e.g. waypoint.school.edu.au): " CADDY_DOMAIN
-  [[ -n "${CADDY_DOMAIN}" ]] || die "Domain is required."
-  is_domain_like "${CADDY_DOMAIN}" || die "Domain looks invalid: ${CADDY_DOMAIN}"
+  # Tenant details
+  echo "Tenant details"
+  echo
+
+  read -rp "Tenant ID (slug, e.g. parkville-secondary): " TENANT_ID
+  [[ -n "${TENANT_ID}" ]] || die "Tenant ID is required."
+  is_slug_like "${TENANT_ID}" || die "Tenant ID must be lowercase letters/numbers/hyphens."
+
+  read -rp "Tenant name (display name, e.g. Parkville Secondary): " TENANT_NAME
+  [[ -n "${TENANT_NAME}" ]] || die "Tenant name is required."
+
+  read -rp "Subdomain (e.g. parkville): " TENANT_SUBDOMAIN
+  [[ -n "${TENANT_SUBDOMAIN}" ]] || die "Subdomain is required."
+  is_slug_like "${TENANT_SUBDOMAIN}" || die "Subdomain must be lowercase letters/numbers/hyphens."
+
+  read -rp "Base domain (e.g. parkvillecollege.vic.edu.au): " TENANT_BASE_DOMAIN
+  [[ -n "${TENANT_BASE_DOMAIN}" ]] || die "Base domain is required."
+  is_domain_like "${TENANT_BASE_DOMAIN}" || die "Base domain looks invalid: ${TENANT_BASE_DOMAIN}"
+
+  CADDY_DOMAIN="${TENANT_SUBDOMAIN}.${TENANT_BASE_DOMAIN}"
+
+  echo
+  echo "Your tenant URL will be:"
+  echo "  ${CADDY_DOMAIN}"
+  echo
 
   # TLS mode
-  echo
   echo "TLS mode:"
   echo "  1) Let's Encrypt (production)  - requires public DNS + ports 80/443 reachable"
   echo "  2) Internal TLS (local)        - self-signed by Caddy (browser will warn)"
@@ -225,7 +265,13 @@ show_plan_and_confirm() {
   echo "------------------------------------------------------------"
   echo "Review configuration"
   echo "------------------------------------------------------------"
-  echo "Domain:          ${CADDY_DOMAIN}"
+  echo "Tenant:"
+  echo "  ID:            ${TENANT_ID}"
+  echo "  Name:          ${TENANT_NAME}"
+  echo "  Subdomain:     ${TENANT_SUBDOMAIN}"
+  echo "  Base domain:   ${TENANT_BASE_DOMAIN}"
+  echo "  FQDN:          ${CADDY_DOMAIN}"
+  echo
   echo "TLS mode:        ${TLS_MODE}"
   [[ "${TLS_MODE}" == "letsencrypt" ]] && echo "ACME email:       ${CADDY_EMAIL}"
   echo "App URL:         ${APP_URL}"
@@ -249,10 +295,7 @@ show_plan_and_confirm() {
 # -----------------------------
 # write stack files (inline)
 # -----------------------------
-write_stack_files() {
-  log "Writing stack files"
-
-  # compose.yml
+write_compose_yml() {
   cat > "${STACK_DIR}/compose.yml" <<'YAML'
 services:
   waypoint-app:
@@ -339,38 +382,45 @@ volumes:
   caddy_data:
   caddy_config:
 YAML
+}
 
-  # Caddyfile (supports 3 modes via TLS_MODE)
-  cat > "${STACK_DIR}/Caddyfile" <<'CADDY'
+write_caddyfile() {
+  # IMPORTANT:
+  # Caddy's global "email" directive cannot be empty.
+  # So we only include it when Let's Encrypt is selected.
+  if [[ "${TLS_MODE}" == "letsencrypt" ]]; then
+    cat > "${STACK_DIR}/Caddyfile" <<CADDY
 {
   email {$CADDY_EMAIL}
 }
 
 {$CADDY_DOMAIN} {
+  reverse_proxy waypoint-app:9000
+}
+CADDY
+    return
+  fi
+
+  # internal + http modes (no global email line)
+  cat > "${STACK_DIR}/Caddyfile" <<'CADDY'
+{$CADDY_DOMAIN} {
   @httpOnly expression `{env.TLS_MODE} == "http"`
   @internalTls expression `{env.TLS_MODE} == "internal"`
-  @letsEncrypt expression `{env.TLS_MODE} == "letsencrypt"`
 
-  # HTTP-only mode
   handle @httpOnly {
     tls off
     reverse_proxy waypoint-app:9000
   }
 
-  # Internal TLS mode (self-signed)
   handle @internalTls {
     tls internal
     reverse_proxy waypoint-app:9000
   }
-
-  # Let's Encrypt mode (default HTTPS / automatic)
-  handle @letsEncrypt {
-    reverse_proxy waypoint-app:9000
-  }
 }
 CADDY
+}
 
-  # .env
+write_env() {
   cat > "${STACK_DIR}/.env" <<EOF
 WAYPOINT_APP_IMAGE=${WAYPOINT_APP_IMAGE}
 
@@ -397,9 +447,21 @@ SESSION_DRIVER=${SESSION_DRIVER}
 CADDY_EMAIL=${CADDY_EMAIL}
 CADDY_DOMAIN=${CADDY_DOMAIN}
 TLS_MODE=${TLS_MODE}
+
+TENANT_ID=${TENANT_ID}
+TENANT_NAME=${TENANT_NAME}
+TENANT_SUBDOMAIN=${TENANT_SUBDOMAIN}
+TENANT_BASE_DOMAIN=${TENANT_BASE_DOMAIN}
 EOF
 
   chmod 600 "${STACK_DIR}/.env"
+}
+
+write_stack_files() {
+  log "Writing stack files"
+  write_compose_yml
+  write_caddyfile
+  write_env
 }
 
 # -----------------------------
@@ -414,7 +476,6 @@ compose_up() {
 
 generate_app_key_in_container() {
   log "Generating APP_KEY inside container and writing it to host .env"
-
   cd "${STACK_DIR}"
 
   KEY="$(docker compose exec -T waypoint-app php -r "echo 'base64:'.base64_encode(random_bytes(32)).PHP_EOL;")"
@@ -425,28 +486,44 @@ generate_app_key_in_container() {
 }
 
 run_migrations() {
-  log "Running migrations"
+  log "Running central migrations"
   cd "${STACK_DIR}"
   docker compose exec -T waypoint-app php artisan migrate --force
 }
 
+create_first_tenant() {
+  log "Creating initial tenant (${TENANT_ID}) and running tenant migrations"
+  cd "${STACK_DIR}"
+
+  docker compose exec -T waypoint-app php artisan make:tenant "${TENANT_ID}" \
+    --name="${TENANT_NAME}" \
+    --subdomain="${TENANT_SUBDOMAIN}" \
+    --base-domain="${TENANT_BASE_DOMAIN}" \
+    --migrate
+}
+
 print_summary() {
   log "Install complete"
-  echo "URL: ${APP_URL}"
+  echo "Tenant URL: ${APP_URL}"
   echo
-  echo "DB_DATABASE=${DB_DATABASE}"
-  echo "DB_USERNAME=${DB_USERNAME}"
-  echo "DB_PASSWORD=${DB_PASSWORD}"
+  echo "Tenant:"
+  echo "  ID:        ${TENANT_ID}"
+  echo "  Name:      ${TENANT_NAME}"
+  echo "  Domain:    ${CADDY_DOMAIN}"
+  echo
+  echo "Database:"
+  echo "  DB_DATABASE=${DB_DATABASE}"
+  echo "  DB_USERNAME=${DB_USERNAME}"
+  echo "  DB_PASSWORD=${DB_PASSWORD}"
   echo
   echo "Next:"
-  echo "  1) Browse to the URL above"
-  echo "  2) Run any admin/bootstrap commands like:"
+  echo "  1) Browse to: ${APP_URL}"
+  echo "  2) Admin/maintenance commands:"
   echo "     cd ${STACK_DIR} && docker compose exec waypoint-app php artisan <command>"
   echo
   if [[ "${TLS_MODE}" == "internal" ]]; then
     echo "Note (Internal TLS):"
     echo "  Your browser will warn until you trust Caddy's local CA."
-    echo "  For quick testing you can proceed through the warning."
     echo
   elif [[ "${TLS_MODE}" == "http" ]]; then
     echo "Note (HTTP):"
@@ -465,12 +542,14 @@ main() {
 
   prompt_inputs
   show_plan_and_confirm
+  maybe_overwrite_existing_stack
 
   write_stack_files
   set_storage_perms
   compose_up
   generate_app_key_in_container
   run_migrations
+  create_first_tenant
   print_summary
 }
 
