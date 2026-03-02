@@ -13,26 +13,24 @@ services:
         condition: service_started
     volumes:
       - /opt/waypoint/data/storage:/var/www/html/storage
+      # IMPORTANT: share /public to nginx via a named volume.
+      # Docker will auto-seed this volume from the image contents on first run.
+      - waypoint_public:/var/www/html/public
     restart: unless-stopped
 
   # -----------------------------
-  # Web (Nginx running inside the Waypoint image)
-  # - serves /public (including /build assets)
-  # - forwards PHP to waypoint-app:9000
+  # Web (Nginx)
+  # Serves /public (including /build) and forwards PHP to waypoint-app:9000
   # -----------------------------
   waypoint-web:
-    image: ${WAYPOINT_APP_IMAGE}
-    env_file:
-      - .env
+    image: nginx:1.27-alpine
     depends_on:
       - waypoint-app
-    user: "0:0"
-    command: ["nginx", "-g", "daemon off;"]
     volumes:
-      # Your server{} config must be mounted as a conf.d file (NOT nginx.conf)
+      # Your nginx server block file
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      # Optional but harmless: allow same persistent storage visibility
-      - /opt/waypoint/data/storage:/var/www/html/storage
+      # Shared public dir seeded from the Waypoint image
+      - waypoint_public:/var/www/html/public:ro
     restart: unless-stopped
 
   # -----------------------------
@@ -120,3 +118,4 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  waypoint_public:
