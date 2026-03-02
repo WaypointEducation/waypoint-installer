@@ -23,16 +23,15 @@ services:
   # Serves /public (including /build) and forwards PHP to waypoint-app:9000
   # -----------------------------
   waypoint-web:
-    image: nginx:1.27-alpine
+    image: ${WAYPOINT_APP_IMAGE}
     depends_on:
       - waypoint-app
+    user: "nginx"
+    command: ["nginx", "-g", "daemon off;"]
     volumes:
-      # Your nginx server block file
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      # Shared public dir seeded from the Waypoint image
-      - waypoint_public:/var/www/html/public:ro
+      - ./nginx.conf:/etc/nginx/http.d/default.conf:ro
+      - /opt/waypoint/data/storage:/var/www/html/storage
     restart: unless-stopped
-
   # -----------------------------
   # Queue Worker
   # -----------------------------
