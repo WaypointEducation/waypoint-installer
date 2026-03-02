@@ -7,7 +7,7 @@ DATA_DIR="/opt/waypoint/data"
 # Where we temporarily download templates (because install.sh is curl'd as a single file)
 TEMPLATES_DIR="${STACK_DIR}/.templates"
 
-# GitHub raw base (pin this to a tag/commit later if you want fully reproducible installs)
+# GitHub raw base (pin this to a tag/commit later if you want reproducible installs)
 INSTALLER_RAW_BASE="https://raw.githubusercontent.com/WaypointEducation/waypoint-installer/main"
 
 # -----------------------------
@@ -55,7 +55,6 @@ need_file() {
 download_file() {
   local url="$1"
   local dest="$2"
-
   # -f fail on HTTP errors, -S show errors, -L follow redirects
   curl -fsSL "$url" -o "$dest" || die "Failed to download: $url"
 }
@@ -125,20 +124,24 @@ maybe_overwrite_existing_stack() {
 fetch_templates() {
   log "Downloading installer templates from GitHub"
 
-  # Template destinations
+  # NOTE: These paths MUST match your waypoint-installer repo layout:
+  # templates/compose.yml
+  # templates/env.example
+  # templates/Caddyfile
+  # templates/nginx.conf   <-- you must create/commit this file in the installer repo
   local compose_t="${TEMPLATES_DIR}/compose.yml"
   local env_t="${TEMPLATES_DIR}/env.example"
-  local caddy_http_t="${TEMPLATES_DIR}/Caddyfile"
-  local nginx_t="${TEMPLATES_DIR}/nginx.default.conf"
+  local caddy_t="${TEMPLATES_DIR}/Caddyfile"
+  local nginx_t="${TEMPLATES_DIR}/nginx.conf"
 
   download_file "${INSTALLER_RAW_BASE}/templates/compose.yml" "${compose_t}"
   download_file "${INSTALLER_RAW_BASE}/templates/env.example" "${env_t}"
-  download_file "${INSTALLER_RAW_BASE}/templates/Caddyfile" "${caddy_http_t}"
-  download_file "${INSTALLER_RAW_BASE}/docker/nginx/default.conf" "${nginx_t}"
+  download_file "${INSTALLER_RAW_BASE}/templates/Caddyfile" "${caddy_t}"
+  download_file "${INSTALLER_RAW_BASE}/templates/nginx.conf" "${nginx_t}"
 
   need_file "${compose_t}"
   need_file "${env_t}"
-  need_file "${caddy_http_t}"
+  need_file "${caddy_t}"
   need_file "${nginx_t}"
 }
 
@@ -159,7 +162,7 @@ Installs to:
 
 Components:
   - Waypoint app (php-fpm)
-  - Waypoint web (nginx inside same image, serves /public including /build)
+  - Waypoint web (nginx, serves /public including /build)
   - MariaDB
   - Redis
   - Caddy (reverse proxy)
@@ -195,7 +198,7 @@ BANNER
   echo "  http://${CADDY_DOMAIN}"
   echo
 
-  # HTTP-only
+  # HTTP-only mode
   TLS_MODE="http"
   CADDY_EMAIL=""
   APP_URL="http://${CADDY_DOMAIN}"
@@ -310,17 +313,17 @@ write_stack_files() {
 
   local compose_t="${TEMPLATES_DIR}/compose.yml"
   local env_t="${TEMPLATES_DIR}/env.example"
-  local caddy_http_t="${TEMPLATES_DIR}/Caddyfile"
-  local nginx_t="${TEMPLATES_DIR}/nginx.default.conf"
+  local caddy_t="${TEMPLATES_DIR}/Caddyfile"
+  local nginx_t="${TEMPLATES_DIR}/nginx.conf"
 
   need_file "${compose_t}"
   need_file "${env_t}"
-  need_file "${caddy_http_t}"
+  need_file "${caddy_t}"
   need_file "${nginx_t}"
 
   render_template "${compose_t}" "${STACK_DIR}/compose.yml"
   render_template "${env_t}" "${STACK_DIR}/.env"
-  render_template "${caddy_http_t}" "${STACK_DIR}/Caddyfile"
+  render_template "${caddy_t}" "${STACK_DIR}/Caddyfile"
 
   # nginx template is already final, no placeholders needed
   cp -f "${nginx_t}" "${STACK_DIR}/nginx.conf"
