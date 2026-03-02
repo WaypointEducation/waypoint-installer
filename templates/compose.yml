@@ -40,7 +40,6 @@ services:
       QUEUE_CONNECTION: ${QUEUE_CONNECTION}
       SESSION_DRIVER: ${SESSION_DRIVER}
 
-      # Tenancy (if you’re using these in the app)
       TENANT_ID: ${TENANT_ID}
       TENANT_NAME: ${TENANT_NAME}
       TENANT_SUBDOMAIN: ${TENANT_SUBDOMAIN}
