@@ -1,13 +1,25 @@
 {$CADDY_DOMAIN} {
-    encode zstd gzip
+  root * /srv/public
+  encode zstd gzip
 
-    root * /var/www/html/public
-    php_fastcgi waypoint-app:9000
+  # Serve static files directly
+  @static path /build/* /images/* /favicon.ico /robots.txt /storage/*
+  handle @static {
     file_server
+  }
 
-    header {
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "SAMEORIGIN"
-        Referrer-Policy "strict-origin-when-cross-origin"
-    }
+  @httpOnly expression `{env.TLS_MODE} == "http"`
+  @internalTls expression `{env.TLS_MODE} == "internal"`
+
+  handle @httpOnly {
+    tls off
+    reverse_proxy waypoint-app:9000
+  }
+
+  handle @internalTls {
+    tls internal
+    reverse_proxy waypoint-app:9000
+  }
+
+  reverse_proxy waypoint-app:9000
 }
