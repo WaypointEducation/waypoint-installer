@@ -34,12 +34,10 @@ confirm() {
 }
 
 is_domain_like() {
-  # light validation (not perfect, but catches empty/space)
   [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$1" == *.* ]]
 }
 
 is_slug_like() {
-  # tenant id / subdomain style: letters, numbers, hyphen
   [[ "$1" =~ ^[a-z0-9]+([a-z0-9-]*[a-z0-9])?$ ]]
 }
 
@@ -96,15 +94,8 @@ ensure_dirs() {
   mkdir -p "${DATA_DIR}/storage"/framework/{cache,sessions,views}
 }
 
-set_storage_perms() {
-  # Debian www-data is 33:33; container runs as www-data too
-  log "Setting storage permissions for container writes"
-  chown -R 33:33 "${DATA_DIR}/storage" || true
-  chmod -R ug+rwX "${DATA_DIR}/storage" || true
-}
-
 maybe_overwrite_existing_stack() {
-  if [[ -f "${STACK_DIR}/compose.yml" || -f "${STACK_DIR}/.env" || -f "${STACK_DIR}/Caddyfile" ]]; then
+  if [[ -f "${STACK_DIR}/compose.yml" || -f "${STACK_DIR}/.env" || -f "${STACK_DIR}/Caddyfile" || -f "${STACK_DIR}/nginx.conf" ]]; then
     echo
     echo "Existing stack files detected in ${STACK_DIR}:"
     ls -la "${STACK_DIR}" | sed -n '1,120p' || true
@@ -125,11 +116,12 @@ prompt_inputs() {
 ============================================================
 This will install the Waypoint Education stack to:
 
-  /opt/waypoint/stack   (compose.yml, .env, Caddyfile)
+  /opt/waypoint/stack   (compose.yml, .env, Caddyfile, nginx.conf)
   /opt/waypoint/data    (MariaDB, Redis, app storage)
 
 Components:
-  - Waypoint Education app (ghcr.io/waypointeducation/waypoint:stable)
+  - Waypoint Education app (php-fpm)
+  - Nginx (serves HTTP + PHP -> php-fpm)
   - MariaDB
   - Redis
   - Caddy (reverse proxy)
@@ -146,7 +138,6 @@ Notes:
 
 BANNER
 
-  # Tenant details
   echo "Tenant details"
   echo
 
@@ -172,7 +163,6 @@ BANNER
   echo "  ${CADDY_DOMAIN}"
   echo
 
-  # TLS mode
   echo "TLS mode:"
   echo "  1) Let's Encrypt (production)  - requires public DNS + ports 80/443 reachable"
   echo "  2) Internal TLS (local)        - self-signed by Caddy (browser will warn)"
@@ -200,7 +190,6 @@ BANNER
       ;;
   esac
 
-  # If Let's Encrypt, validate DNS resolves publicly (hosts file doesn't count)
   if [[ "${TLS_MODE}" == "letsencrypt" ]]; then
     echo
     echo "Checking public DNS for ${CADDY_DOMAIN}..."
@@ -209,14 +198,12 @@ BANNER
     fi
   fi
 
-  # App URL based on TLS mode
   if [[ "${TLS_MODE}" == "http" ]]; then
     APP_URL="http://${CADDY_DOMAIN}"
   else
     APP_URL="https://${CADDY_DOMAIN}"
   fi
 
-  # Database creds
   echo
   echo "Database credentials:"
   echo "  A) Auto-generate secure credentials (recommended)"
@@ -252,11 +239,14 @@ BANNER
   REDIS_HOST="redis"
   REDIS_PORT="6379"
 
+  # Use Redis for Laravel caches/sessions/queues
   CACHE_DRIVER="redis"
   QUEUE_CONNECTION="redis"
   SESSION_DRIVER="redis"
 
-  # We'll generate APP_KEY inside the container after it's up
+  # Ensure we use phpredis (requires ext-redis in the image)
+  REDIS_CLIENT="phpredis"
+
   APP_KEY=""
 }
 
@@ -309,6 +299,16 @@ services:
         condition: service_started
     volumes:
       - /opt/waypoint/data/storage:/var/www/html/storage
+    restart: unless-stopped
+
+  # Nginx serves HTTP and forwards PHP to php-fpm (waypoint-app:9000)
+  waypoint-web:
+    image: nginx:1.27-alpine
+    depends_on:
+      - waypoint-app
+    ports: []   # not published; Caddy talks to it on the Docker network
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
     restart: unless-stopped
 
   waypoint-queue:
@@ -375,7 +375,7 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
-      - waypoint-app
+      - waypoint-web
     restart: unless-stopped
 
 volumes:
@@ -384,10 +384,33 @@ volumes:
 YAML
 }
 
+write_nginx_conf() {
+  # Nginx runs in its own container; it needs the app code to serve /public.
+  # Because the app code is inside waypoint-app image, we proxy only PHP to waypoint-app,
+  # and let Laravel handle routes. For static assets, we rely on Laravel public/ being available.
+  #
+  # NOTE: In a production-grade setup, we'd share /var/www/html/public into this container via a volume
+  # or serve static assets via a dedicated mechanism. For now, Laravel will serve assets via routing
+  # when needed behind Caddy; keep it minimal.
+  cat > "${STACK_DIR}/nginx.conf" <<'NGINX'
+server {
+  listen 8080;
+  server_name _;
+
+  # We don't have /public files in this container by default.
+  # Pass everything to Laravel via PHP front controller.
+  location / {
+    include fastcgi_params;
+    fastcgi_param SCRIPT_FILENAME /var/www/html/public/index.php;
+    fastcgi_param DOCUMENT_ROOT /var/www/html/public;
+    fastcgi_param HTTP_HOST $host;
+    fastcgi_pass waypoint-app:9000;
+  }
+}
+NGINX
+}
+
 write_caddyfile() {
-  # IMPORTANT:
-  # Caddy's global "email" directive cannot be empty.
-  # So we only include it when Let's Encrypt is selected.
   if [[ "${TLS_MODE}" == "letsencrypt" ]]; then
     cat > "${STACK_DIR}/Caddyfile" <<CADDY
 {
@@ -395,27 +418,30 @@ write_caddyfile() {
 }
 
 {$CADDY_DOMAIN} {
-  reverse_proxy waypoint-app:9000
+  reverse_proxy waypoint-web:8080
 }
 CADDY
     return
   fi
 
-  # internal + http modes (no global email line)
-  cat > "${STACK_DIR}/Caddyfile" <<'CADDY'
+  if [[ "${TLS_MODE}" == "internal" ]]; then
+    cat > "${STACK_DIR}/Caddyfile" <<'CADDY'
 {$CADDY_DOMAIN} {
-  @httpOnly expression `{env.TLS_MODE} == "http"`
-  @internalTls expression `{env.TLS_MODE} == "internal"`
+  tls internal
+  reverse_proxy waypoint-web:8080
+}
+CADDY
+    return
+  fi
 
-  handle @httpOnly {
-    tls off
-    reverse_proxy waypoint-app:9000
-  }
+  # http mode
+  cat > "${STACK_DIR}/Caddyfile" <<'CADDY'
+{
+  auto_https off
+}
 
-  handle @internalTls {
-    tls internal
-    reverse_proxy waypoint-app:9000
-  }
+http://{$CADDY_DOMAIN} {
+  reverse_proxy waypoint-web:8080
 }
 CADDY
 }
@@ -439,6 +465,7 @@ MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
 
 REDIS_HOST=${REDIS_HOST}
 REDIS_PORT=${REDIS_PORT}
+REDIS_CLIENT=${REDIS_CLIENT}
 
 CACHE_DRIVER=${CACHE_DRIVER}
 QUEUE_CONNECTION=${QUEUE_CONNECTION}
@@ -460,6 +487,7 @@ EOF
 write_stack_files() {
   log "Writing stack files"
   write_compose_yml
+  write_nginx_conf
   write_caddyfile
   write_env
 }
@@ -472,6 +500,22 @@ compose_up() {
   cd "${STACK_DIR}"
   docker compose pull
   docker compose up -d
+}
+
+detect_and_set_storage_perms() {
+  log "Detecting container UID/GID and setting storage permissions"
+  cd "${STACK_DIR}"
+
+  # Get uid/gid of the user inside waypoint-app (works on alpine/debian)
+  local uid gid
+  uid="$(docker compose exec -T waypoint-app id -u)"
+  gid="$(docker compose exec -T waypoint-app id -g)"
+
+  [[ -n "${uid}" && -n "${gid}" ]] || die "Could not detect container uid/gid."
+
+  chown -R "${uid}:${gid}" "${DATA_DIR}/storage" || true
+  chmod -R ug+rwX "${DATA_DIR}/storage" || true
+  find "${DATA_DIR}/storage" -type d -exec chmod g+s {} \; || true
 }
 
 generate_app_key_in_container() {
@@ -545,8 +589,11 @@ main() {
   maybe_overwrite_existing_stack
 
   write_stack_files
-  set_storage_perms
   compose_up
+
+  # Now that containers exist, set perms using detected uid/gid
+  detect_and_set_storage_perms
+
   generate_app_key_in_container
   run_migrations
   create_first_tenant
