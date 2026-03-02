@@ -4,10 +4,7 @@ set -euo pipefail
 STACK_DIR="/opt/waypoint/stack"
 DATA_DIR="/opt/waypoint/data"
 
-# Where we temporarily download templates (because install.sh is curl'd as a single file)
-TEMPLATES_DIR="${STACK_DIR}/.templates"
-
-# GitHub raw base (pin this to a tag/commit later if you want reproducible installs)
+# GitHub raw base for waypoint-installer templates
 INSTALLER_RAW_BASE="https://raw.githubusercontent.com/WaypointEducation/waypoint-installer/main"
 
 # -----------------------------
@@ -47,15 +44,9 @@ is_slug_like() {
   [[ "$1" =~ ^[a-z0-9]+([a-z0-9-]*[a-z0-9])?$ ]]
 }
 
-need_file() {
-  local f="$1"
-  [[ -f "$f" ]] || die "Missing required file: $f"
-}
-
 download_file() {
   local url="$1"
   local dest="$2"
-  # -f fail on HTTP errors, -S show errors, -L follow redirects
   curl -fsSL "$url" -o "$dest" || die "Failed to download: $url"
 }
 
@@ -105,7 +96,6 @@ ensure_dirs() {
   mkdir -p "${DATA_DIR}/"{mariadb,redis,storage}
   mkdir -p "${DATA_DIR}/storage"/logs
   mkdir -p "${DATA_DIR}/storage"/framework/{cache,sessions,views}
-  mkdir -p "${TEMPLATES_DIR}"
 }
 
 maybe_overwrite_existing_stack() {
@@ -116,33 +106,6 @@ maybe_overwrite_existing_stack() {
     echo
     confirm "Overwrite existing stack files in ${STACK_DIR}?" || die "Cancelled by user."
   fi
-}
-
-# -----------------------------
-# download templates (runtime)
-# -----------------------------
-fetch_templates() {
-  log "Downloading installer templates from GitHub"
-
-  # NOTE: These paths MUST match your waypoint-installer repo layout:
-  # templates/compose.yml
-  # templates/env.example
-  # templates/Caddyfile
-  # templates/nginx.conf   <-- you must create/commit this file in the installer repo
-  local compose_t="${TEMPLATES_DIR}/compose.yml"
-  local env_t="${TEMPLATES_DIR}/env.example"
-  local caddy_t="${TEMPLATES_DIR}/Caddyfile"
-  local nginx_t="${TEMPLATES_DIR}/nginx.conf"
-
-  download_file "${INSTALLER_RAW_BASE}/templates/compose.yml" "${compose_t}"
-  download_file "${INSTALLER_RAW_BASE}/templates/env.example" "${env_t}"
-  download_file "${INSTALLER_RAW_BASE}/templates/Caddyfile" "${caddy_t}"
-  download_file "${INSTALLER_RAW_BASE}/templates/nginx.conf" "${nginx_t}"
-
-  need_file "${compose_t}"
-  need_file "${env_t}"
-  need_file "${caddy_t}"
-  need_file "${nginx_t}"
 }
 
 # -----------------------------
@@ -230,6 +193,7 @@ BANNER
   WAYPOINT_APP_IMAGE="ghcr.io/waypointeducation/waypoint:stable"
   APP_ENV="production"
   APP_DEBUG="false"
+  APP_KEY=""
 
   DB_CONNECTION="mysql"
   DB_HOST="mariadb"
@@ -242,8 +206,6 @@ BANNER
   CACHE_DRIVER="redis"
   QUEUE_CONNECTION="redis"
   SESSION_DRIVER="redis"
-
-  APP_KEY=""
 }
 
 show_plan_and_confirm() {
@@ -276,69 +238,78 @@ show_plan_and_confirm() {
 }
 
 # -----------------------------
-# write stack files from downloaded templates
+# write stack files
 # -----------------------------
-render_template() {
-  # Usage: render_template <src> <dest>
-  local src="$1"
-  local dest="$2"
+download_stack_templates() {
+  log "Downloading stack templates from GitHub"
 
-  sed \
-    -e "s|\${WAYPOINT_APP_IMAGE}|${WAYPOINT_APP_IMAGE}|g" \
-    -e "s|\${CADDY_DOMAIN}|${CADDY_DOMAIN}|g" \
-    -e "s|\${CADDY_EMAIL}|${CADDY_EMAIL}|g" \
-    -e "s|\${TLS_MODE}|${TLS_MODE}|g" \
-    -e "s|\${DB_DATABASE}|${DB_DATABASE}|g" \
-    -e "s|\${DB_USERNAME}|${DB_USERNAME}|g" \
-    -e "s|\${DB_PASSWORD}|${DB_PASSWORD}|g" \
-    -e "s|\${MYSQL_ROOT_PASSWORD}|${MYSQL_ROOT_PASSWORD}|g" \
-    -e "s|\${APP_ENV}|${APP_ENV}|g" \
-    -e "s|\${APP_DEBUG}|${APP_DEBUG}|g" \
-    -e "s|\${APP_URL}|${APP_URL}|g" \
-    -e "s|\${REDIS_HOST}|${REDIS_HOST}|g" \
-    -e "s|\${REDIS_PORT}|${REDIS_PORT}|g" \
-    -e "s|\${REDIS_CLIENT}|${REDIS_CLIENT}|g" \
-    -e "s|\${CACHE_DRIVER}|${CACHE_DRIVER}|g" \
-    -e "s|\${QUEUE_CONNECTION}|${QUEUE_CONNECTION}|g" \
-    -e "s|\${SESSION_DRIVER}|${SESSION_DRIVER}|g" \
-    -e "s|\${TENANT_ID}|${TENANT_ID}|g" \
-    -e "s|\${TENANT_NAME}|${TENANT_NAME}|g" \
-    -e "s|\${TENANT_SUBDOMAIN}|${TENANT_SUBDOMAIN}|g" \
-    -e "s|\${TENANT_BASE_DOMAIN}|${TENANT_BASE_DOMAIN}|g" \
-    "$src" > "$dest"
+  # These MUST exist in waypoint-installer repo:
+  # templates/compose.yml
+  # templates/Caddyfile
+  # templates/nginx.conf
+  download_file "${INSTALLER_RAW_BASE}/templates/compose.yml" "${STACK_DIR}/compose.yml"
+  download_file "${INSTALLER_RAW_BASE}/templates/Caddyfile"  "${STACK_DIR}/Caddyfile"
+  download_file "${INSTALLER_RAW_BASE}/templates/nginx.conf" "${STACK_DIR}/nginx.conf"
+}
+
+write_env_file() {
+  log "Writing .env"
+  cat > "${STACK_DIR}/.env" <<EOF
+WAYPOINT_APP_IMAGE=${WAYPOINT_APP_IMAGE}
+
+APP_ENV=${APP_ENV}
+APP_DEBUG=${APP_DEBUG}
+APP_URL=${APP_URL}
+APP_KEY=${APP_KEY}
+
+DB_CONNECTION=${DB_CONNECTION}
+DB_HOST=${DB_HOST}
+DB_PORT=${DB_PORT}
+DB_DATABASE=${DB_DATABASE}
+DB_USERNAME=${DB_USERNAME}
+DB_PASSWORD=${DB_PASSWORD}
+MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+
+REDIS_HOST=${REDIS_HOST}
+REDIS_PORT=${REDIS_PORT}
+REDIS_CLIENT=${REDIS_CLIENT}
+
+CACHE_DRIVER=${CACHE_DRIVER}
+QUEUE_CONNECTION=${QUEUE_CONNECTION}
+SESSION_DRIVER=${SESSION_DRIVER}
+
+CADDY_EMAIL=${CADDY_EMAIL}
+CADDY_DOMAIN=${CADDY_DOMAIN}
+TLS_MODE=${TLS_MODE}
+
+TENANT_ID=${TENANT_ID}
+TENANT_NAME=${TENANT_NAME}
+TENANT_SUBDOMAIN=${TENANT_SUBDOMAIN}
+TENANT_BASE_DOMAIN=${TENANT_BASE_DOMAIN}
+EOF
+
+  chmod 600 "${STACK_DIR}/.env"
 }
 
 write_stack_files() {
   log "Writing stack files"
-
-  local compose_t="${TEMPLATES_DIR}/compose.yml"
-  local env_t="${TEMPLATES_DIR}/env.example"
-  local caddy_t="${TEMPLATES_DIR}/Caddyfile"
-  local nginx_t="${TEMPLATES_DIR}/nginx.conf"
-
-  need_file "${compose_t}"
-  need_file "${env_t}"
-  need_file "${caddy_t}"
-  need_file "${nginx_t}"
-
-  render_template "${compose_t}" "${STACK_DIR}/compose.yml"
-  render_template "${env_t}" "${STACK_DIR}/.env"
-  render_template "${caddy_t}" "${STACK_DIR}/Caddyfile"
-
-  # nginx template is already final, no placeholders needed
-  cp -f "${nginx_t}" "${STACK_DIR}/nginx.conf"
-
-  chmod 600 "${STACK_DIR}/.env"
+  download_stack_templates
+  write_env_file
 }
 
 # -----------------------------
 # bring up stack + init
 # -----------------------------
+dc() {
+  # always run compose with explicit env file
+  docker compose --env-file "${STACK_DIR}/.env" "$@"
+}
+
 compose_up() {
   log "Starting services"
   cd "${STACK_DIR}"
-  docker compose pull
-  docker compose up -d
+  dc pull
+  dc up -d
 }
 
 detect_and_set_storage_perms() {
@@ -346,9 +317,8 @@ detect_and_set_storage_perms() {
   cd "${STACK_DIR}"
 
   local uid gid
-  uid="$(docker compose exec -T waypoint-app id -u)"
-  gid="$(docker compose exec -T waypoint-app id -g)"
-
+  uid="$(dc exec -T waypoint-app id -u)"
+  gid="$(dc exec -T waypoint-app id -g)"
   [[ -n "${uid}" && -n "${gid}" ]] || die "Could not detect container uid/gid."
 
   chown -R "${uid}:${gid}" "${DATA_DIR}/storage" || true
@@ -361,24 +331,24 @@ generate_app_key_in_container() {
   cd "${STACK_DIR}"
 
   local key
-  key="$(docker compose exec -T waypoint-app php -r "echo 'base64:'.base64_encode(random_bytes(32)).PHP_EOL;")"
+  key="$(dc exec -T waypoint-app php -r "echo 'base64:'.base64_encode(random_bytes(32)).PHP_EOL;")"
   [[ -n "${key}" ]] || die "Failed to generate APP_KEY."
 
   sed -i "s|^APP_KEY=.*$|APP_KEY=${key}|" "${STACK_DIR}/.env"
-  docker compose up -d
+  dc up -d
 }
 
 run_migrations() {
   log "Running central migrations"
   cd "${STACK_DIR}"
-  docker compose exec -T waypoint-app php artisan migrate --force
+  dc exec -T waypoint-app php artisan migrate --force
 }
 
 create_first_tenant() {
   log "Creating initial tenant (${TENANT_ID}) and running tenant migrations"
   cd "${STACK_DIR}"
 
-  docker compose exec -T waypoint-app php artisan make:tenant "${TENANT_ID}" \
+  dc exec -T waypoint-app php artisan make:tenant "${TENANT_ID}" \
     --name="${TENANT_NAME}" \
     --subdomain="${TENANT_SUBDOMAIN}" \
     --base-domain="${TENANT_BASE_DOMAIN}" \
@@ -402,7 +372,7 @@ print_summary() {
   echo "Next:"
   echo "  1) Browse to: ${APP_URL}"
   echo "  2) Admin commands:"
-  echo "     cd ${STACK_DIR} && docker compose exec waypoint-app php artisan <command>"
+  echo "     cd ${STACK_DIR} && docker compose --env-file .env exec waypoint-app php artisan <command>"
   echo
   echo "NOTE:"
   echo "  This installer deploys HTTP only."
@@ -415,8 +385,6 @@ main() {
   install_docker
   ensure_compose
   ensure_dirs
-
-  fetch_templates
 
   prompt_inputs
   show_plan_and_confirm
