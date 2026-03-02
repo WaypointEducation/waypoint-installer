@@ -4,6 +4,11 @@ set -euo pipefail
 STACK_DIR="/opt/waypoint/stack"
 DATA_DIR="/opt/waypoint/data"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+TEMPLATES_DIR="${SCRIPT_DIR}/templates"
+NGINX_TEMPLATE="${SCRIPT_DIR}/docker/nginx/default.conf"
+
 # -----------------------------
 # helpers
 # -----------------------------
@@ -44,6 +49,11 @@ is_slug_like() {
 dns_resolves() {
   local host="$1"
   getent ahosts "$host" >/dev/null 2>&1
+}
+
+need_file() {
+  local f="$1"
+  [[ -f "$f" ]] || die "Missing required file: $f"
 }
 
 # -----------------------------
@@ -114,26 +124,22 @@ prompt_inputs() {
 ============================================================
                Welcome to Waypoint Education Installer
 ============================================================
-This will install the Waypoint Education stack to:
+Installs to:
 
   /opt/waypoint/stack   (compose.yml, .env, Caddyfile, nginx.conf)
-  /opt/waypoint/data    (MariaDB, Redis, app storage)
+  /opt/waypoint/data    (MariaDB, Redis, Laravel storage)
 
 Components:
-  - Waypoint Education app (php-fpm)
-  - Nginx (serves HTTP + PHP -> php-fpm)
+  - Waypoint app (php-fpm)
+  - Nginx (serves static assets + forwards PHP to php-fpm)
   - MariaDB
   - Redis
   - Caddy (reverse proxy)
 
-You will be asked for:
-  - Tenant details (tenant id, name, subdomain, base domain)
-  - TLS mode (Let's Encrypt / Internal TLS / HTTP)
-  - Database credentials (auto-generate or custom)
-
-Notes:
-  - Waypoint is tenant-first. This installer will create your first tenant
-    and map it to: <subdomain>.<base-domain>
+IMPORTANT (current testing mode):
+  - TLS selection is collected, but for now we deploy HTTP only.
+    We'll switch the Caddyfile templates to real TLS when you
+    production-test the full flow.
 ============================================================
 
 BANNER
@@ -145,10 +151,10 @@ BANNER
   [[ -n "${TENANT_ID}" ]] || die "Tenant ID is required."
   is_slug_like "${TENANT_ID}" || die "Tenant ID must be lowercase letters/numbers/hyphens."
 
-  read -rp "Tenant name (display name, e.g. Parkville Secondary): " TENANT_NAME
+  read -rp "Tenant name (display name, e.g. Parkville College): " TENANT_NAME
   [[ -n "${TENANT_NAME}" ]] || die "Tenant name is required."
 
-  read -rp "Subdomain (e.g. parkville): " TENANT_SUBDOMAIN
+  read -rp "Subdomain (e.g. waypoint): " TENANT_SUBDOMAIN
   [[ -n "${TENANT_SUBDOMAIN}" ]] || die "Subdomain is required."
   is_slug_like "${TENANT_SUBDOMAIN}" || die "Subdomain must be lowercase letters/numbers/hyphens."
 
@@ -160,16 +166,16 @@ BANNER
 
   echo
   echo "Your tenant URL will be:"
-  echo "  ${CADDY_DOMAIN}"
+  echo "  http://${CADDY_DOMAIN}"
   echo
 
-  echo "TLS mode:"
-  echo "  1) Let's Encrypt (production)  - requires public DNS + ports 80/443 reachable"
-  echo "  2) Internal TLS (local)        - self-signed by Caddy (browser will warn)"
-  echo "  3) HTTP only (local)           - no TLS"
+  echo "TLS mode (collected for later):"
+  echo "  1) Let's Encrypt (production)"
+  echo "  2) Internal TLS (local)"
+  echo "  3) HTTP only (local)"
   echo
-  read -rp "Choose TLS mode [1/2/3] (default 2): " TLS_CHOICE
-  TLS_CHOICE="${TLS_CHOICE:-2}"
+  read -rp "Choose TLS mode [1/2/3] (default 3): " TLS_CHOICE
+  TLS_CHOICE="${TLS_CHOICE:-3}"
 
   case "${TLS_CHOICE}" in
     1)
@@ -198,11 +204,8 @@ BANNER
     fi
   fi
 
-  if [[ "${TLS_MODE}" == "http" ]]; then
-    APP_URL="http://${CADDY_DOMAIN}"
-  else
-    APP_URL="https://${CADDY_DOMAIN}"
-  fi
+  # For now, always HTTP to stop churn while you test the installer flow.
+  APP_URL="http://${CADDY_DOMAIN}"
 
   echo
   echo "Database credentials:"
@@ -238,14 +241,11 @@ BANNER
 
   REDIS_HOST="redis"
   REDIS_PORT="6379"
+  REDIS_CLIENT="phpredis"
 
-  # Use Redis for Laravel caches/sessions/queues
   CACHE_DRIVER="redis"
   QUEUE_CONNECTION="redis"
   SESSION_DRIVER="redis"
-
-  # Ensure we use phpredis (requires ext-redis in the image)
-  REDIS_CLIENT="phpredis"
 
   APP_KEY=""
 }
@@ -258,12 +258,9 @@ show_plan_and_confirm() {
   echo "Tenant:"
   echo "  ID:            ${TENANT_ID}"
   echo "  Name:          ${TENANT_NAME}"
-  echo "  Subdomain:     ${TENANT_SUBDOMAIN}"
-  echo "  Base domain:   ${TENANT_BASE_DOMAIN}"
-  echo "  FQDN:          ${CADDY_DOMAIN}"
+  echo "  Domain:        ${CADDY_DOMAIN}"
   echo
-  echo "TLS mode:        ${TLS_MODE}"
-  [[ "${TLS_MODE}" == "letsencrypt" ]] && echo "ACME email:       ${CADDY_EMAIL}"
+  echo "TLS mode chosen: ${TLS_MODE} (NOTE: deploying HTTP only for now)"
   echo "App URL:         ${APP_URL}"
   echo
   echo "DB database:     ${DB_DATABASE}"
@@ -283,217 +280,61 @@ show_plan_and_confirm() {
 }
 
 # -----------------------------
-# write stack files (inline)
+# write stack files from repo templates
 # -----------------------------
-write_compose_yml() {
-  cat > "${STACK_DIR}/compose.yml" <<'YAML'
-services:
-  waypoint-app:
-    image: ${WAYPOINT_APP_IMAGE}
-    env_file:
-      - .env
-    depends_on:
-      mariadb:
-        condition: service_healthy
-      redis:
-        condition: service_started
-    volumes:
-      - /opt/waypoint/data/storage:/var/www/html/storage
-    restart: unless-stopped
+render_template() {
+  # very small envsubst-like renderer (safe for our simple placeholders)
+  # Usage: render_template <src> <dest>
+  local src="$1"
+  local dest="$2"
 
-  # Nginx serves HTTP and forwards PHP to php-fpm (waypoint-app:9000)
-  waypoint-web:
-    image: nginx:1.27-alpine
-    depends_on:
-      - waypoint-app
-    ports: []   # not published; Caddy talks to it on the Docker network
-    volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-    restart: unless-stopped
-
-  waypoint-queue:
-    image: ${WAYPOINT_APP_IMAGE}
-    env_file:
-      - .env
-    depends_on:
-      mariadb:
-        condition: service_healthy
-      redis:
-        condition: service_started
-    volumes:
-      - /opt/waypoint/data/storage:/var/www/html/storage
-    command: ["php", "artisan", "queue:work", "--sleep=1", "--tries=1"]
-    restart: unless-stopped
-
-  waypoint-scheduler:
-    image: ${WAYPOINT_APP_IMAGE}
-    env_file:
-      - .env
-    depends_on:
-      mariadb:
-        condition: service_healthy
-      redis:
-        condition: service_started
-    volumes:
-      - /opt/waypoint/data/storage:/var/www/html/storage
-    command: ["sh", "-lc", "while true; do php artisan schedule:run --no-interaction; sleep 60; done"]
-    restart: unless-stopped
-
-  mariadb:
-    image: mariadb:11
-    environment:
-      MARIADB_DATABASE: ${DB_DATABASE}
-      MARIADB_USER: ${DB_USERNAME}
-      MARIADB_PASSWORD: ${DB_PASSWORD}
-      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-    volumes:
-      - /opt/waypoint/data/mariadb:/var/lib/mysql
-    healthcheck:
-      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -p$${MARIADB_ROOT_PASSWORD} --silent"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
-    restart: unless-stopped
-
-  redis:
-    image: redis:7-alpine
-    volumes:
-      - /opt/waypoint/data/redis:/data
-    restart: unless-stopped
-
-  caddy:
-    image: caddy:2-alpine
-    ports:
-      - "80:80"
-      - "443:443"
-    environment:
-      CADDY_EMAIL: ${CADDY_EMAIL}
-      CADDY_DOMAIN: ${CADDY_DOMAIN}
-      TLS_MODE: ${TLS_MODE}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      - waypoint-web
-    restart: unless-stopped
-
-volumes:
-  caddy_data:
-  caddy_config:
-YAML
-}
-
-write_nginx_conf() {
-  # Nginx runs in its own container; it needs the app code to serve /public.
-  # Because the app code is inside waypoint-app image, we proxy only PHP to waypoint-app,
-  # and let Laravel handle routes. For static assets, we rely on Laravel public/ being available.
-  #
-  # NOTE: In a production-grade setup, we'd share /var/www/html/public into this container via a volume
-  # or serve static assets via a dedicated mechanism. For now, Laravel will serve assets via routing
-  # when needed behind Caddy; keep it minimal.
-  cat > "${STACK_DIR}/nginx.conf" <<'NGINX'
-server {
-  listen 8080;
-  server_name _;
-
-  # We don't have /public files in this container by default.
-  # Pass everything to Laravel via PHP front controller.
-  location / {
-    include fastcgi_params;
-    fastcgi_param SCRIPT_FILENAME /var/www/html/public/index.php;
-    fastcgi_param DOCUMENT_ROOT /var/www/html/public;
-    fastcgi_param HTTP_HOST $host;
-    fastcgi_pass waypoint-app:9000;
-  }
-}
-NGINX
-}
-
-write_caddyfile() {
-  if [[ "${TLS_MODE}" == "letsencrypt" ]]; then
-    cat > "${STACK_DIR}/Caddyfile" <<CADDY
-{
-  email {$CADDY_EMAIL}
-}
-
-{$CADDY_DOMAIN} {
-  reverse_proxy waypoint-web:8080
-}
-CADDY
-    return
-  fi
-
-  if [[ "${TLS_MODE}" == "internal" ]]; then
-    cat > "${STACK_DIR}/Caddyfile" <<'CADDY'
-{$CADDY_DOMAIN} {
-  tls internal
-  reverse_proxy waypoint-web:8080
-}
-CADDY
-    return
-  fi
-
-  # http mode
-  cat > "${STACK_DIR}/Caddyfile" <<'CADDY'
-{
-  auto_https off
-}
-
-http://{$CADDY_DOMAIN} {
-  reverse_proxy waypoint-web:8080
-}
-CADDY
-}
-
-write_env() {
-  cat > "${STACK_DIR}/.env" <<EOF
-WAYPOINT_APP_IMAGE=${WAYPOINT_APP_IMAGE}
-
-APP_ENV=${APP_ENV}
-APP_DEBUG=${APP_DEBUG}
-APP_URL=${APP_URL}
-APP_KEY=${APP_KEY}
-
-DB_CONNECTION=${DB_CONNECTION}
-DB_HOST=${DB_HOST}
-DB_PORT=${DB_PORT}
-DB_DATABASE=${DB_DATABASE}
-DB_USERNAME=${DB_USERNAME}
-DB_PASSWORD=${DB_PASSWORD}
-MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
-
-REDIS_HOST=${REDIS_HOST}
-REDIS_PORT=${REDIS_PORT}
-REDIS_CLIENT=${REDIS_CLIENT}
-
-CACHE_DRIVER=${CACHE_DRIVER}
-QUEUE_CONNECTION=${QUEUE_CONNECTION}
-SESSION_DRIVER=${SESSION_DRIVER}
-
-CADDY_EMAIL=${CADDY_EMAIL}
-CADDY_DOMAIN=${CADDY_DOMAIN}
-TLS_MODE=${TLS_MODE}
-
-TENANT_ID=${TENANT_ID}
-TENANT_NAME=${TENANT_NAME}
-TENANT_SUBDOMAIN=${TENANT_SUBDOMAIN}
-TENANT_BASE_DOMAIN=${TENANT_BASE_DOMAIN}
-EOF
-
-  chmod 600 "${STACK_DIR}/.env"
+  sed \
+    -e "s|\${WAYPOINT_APP_IMAGE}|${WAYPOINT_APP_IMAGE}|g" \
+    -e "s|\${CADDY_DOMAIN}|${CADDY_DOMAIN}|g" \
+    -e "s|\${CADDY_EMAIL}|${CADDY_EMAIL}|g" \
+    -e "s|\${TLS_MODE}|${TLS_MODE}|g" \
+    -e "s|\${DB_DATABASE}|${DB_DATABASE}|g" \
+    -e "s|\${DB_USERNAME}|${DB_USERNAME}|g" \
+    -e "s|\${DB_PASSWORD}|${DB_PASSWORD}|g" \
+    -e "s|\${MYSQL_ROOT_PASSWORD}|${MYSQL_ROOT_PASSWORD}|g" \
+    -e "s|\${APP_ENV}|${APP_ENV}|g" \
+    -e "s|\${APP_DEBUG}|${APP_DEBUG}|g" \
+    -e "s|\${APP_URL}|${APP_URL}|g" \
+    -e "s|\${REDIS_HOST}|${REDIS_HOST}|g" \
+    -e "s|\${REDIS_PORT}|${REDIS_PORT}|g" \
+    -e "s|\${REDIS_CLIENT}|${REDIS_CLIENT}|g" \
+    -e "s|\${CACHE_DRIVER}|${CACHE_DRIVER}|g" \
+    -e "s|\${QUEUE_CONNECTION}|${QUEUE_CONNECTION}|g" \
+    -e "s|\${SESSION_DRIVER}|${SESSION_DRIVER}|g" \
+    -e "s|\${TENANT_ID}|${TENANT_ID}|g" \
+    -e "s|\${TENANT_NAME}|${TENANT_NAME}|g" \
+    -e "s|\${TENANT_SUBDOMAIN}|${TENANT_SUBDOMAIN}|g" \
+    -e "s|\${TENANT_BASE_DOMAIN}|${TENANT_BASE_DOMAIN}|g" \
+    "$src" > "$dest"
 }
 
 write_stack_files() {
   log "Writing stack files"
-  write_compose_yml
-  write_nginx_conf
-  write_caddyfile
-  write_env
+
+  need_file "${TEMPLATES_DIR}/compose.yml"
+  need_file "${TEMPLATES_DIR}/env.example"
+  need_file "${TEMPLATES_DIR}/Caddyfile.http"
+  need_file "${NGINX_TEMPLATE}"
+
+  render_template "${TEMPLATES_DIR}/compose.yml" "${STACK_DIR}/compose.yml"
+  render_template "${TEMPLATES_DIR}/env.example" "${STACK_DIR}/.env"
+
+  # Force HTTP Caddyfile for now (testing mode)
+  render_template "${TEMPLATES_DIR}/Caddyfile.http" "${STACK_DIR}/Caddyfile"
+
+  # nginx default.conf -> nginx.conf in stack dir
+  cp -f "${NGINX_TEMPLATE}" "${STACK_DIR}/nginx.conf"
+
+  chmod 600 "${STACK_DIR}/.env"
 }
 
 # -----------------------------
-# bring up stack + app init
+# bring up stack + init
 # -----------------------------
 compose_up() {
   log "Starting services"
@@ -503,10 +344,9 @@ compose_up() {
 }
 
 detect_and_set_storage_perms() {
-  log "Detecting container UID/GID and setting storage permissions"
+  log "Fixing Laravel storage permissions (auto-detect container UID/GID)"
   cd "${STACK_DIR}"
 
-  # Get uid/gid of the user inside waypoint-app (works on alpine/debian)
   local uid gid
   uid="$(docker compose exec -T waypoint-app id -u)"
   gid="$(docker compose exec -T waypoint-app id -g)"
@@ -522,10 +362,11 @@ generate_app_key_in_container() {
   log "Generating APP_KEY inside container and writing it to host .env"
   cd "${STACK_DIR}"
 
-  KEY="$(docker compose exec -T waypoint-app php -r "echo 'base64:'.base64_encode(random_bytes(32)).PHP_EOL;")"
-  [[ -n "${KEY}" ]] || die "Failed to generate APP_KEY."
+  local key
+  key="$(docker compose exec -T waypoint-app php -r "echo 'base64:'.base64_encode(random_bytes(32)).PHP_EOL;")"
+  [[ -n "${key}" ]] || die "Failed to generate APP_KEY."
 
-  sed -i "s|^APP_KEY=.*$|APP_KEY=${KEY}|" "${STACK_DIR}/.env"
+  sed -i "s|^APP_KEY=.*$|APP_KEY=${key}|" "${STACK_DIR}/.env"
   docker compose up -d
 }
 
@@ -562,18 +403,11 @@ print_summary() {
   echo
   echo "Next:"
   echo "  1) Browse to: ${APP_URL}"
-  echo "  2) Admin/maintenance commands:"
+  echo "  2) Admin commands:"
   echo "     cd ${STACK_DIR} && docker compose exec waypoint-app php artisan <command>"
   echo
-  if [[ "${TLS_MODE}" == "internal" ]]; then
-    echo "Note (Internal TLS):"
-    echo "  Your browser will warn until you trust Caddy's local CA."
-    echo
-  elif [[ "${TLS_MODE}" == "http" ]]; then
-    echo "Note (HTTP):"
-    echo "  This is plaintext HTTP. Use Let's Encrypt mode for production."
-    echo
-  fi
+  echo "NOTE:"
+  echo "  TLS selection is collected but HTTP is forced for this installer build."
 }
 
 main() {
@@ -590,10 +424,7 @@ main() {
 
   write_stack_files
   compose_up
-
-  # Now that containers exist, set perms using detected uid/gid
   detect_and_set_storage_perms
-
   generate_app_key_in_container
   run_migrations
   create_first_tenant
