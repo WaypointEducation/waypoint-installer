@@ -1,25 +1,7 @@
-{$CADDY_DOMAIN} {
-  root * /srv/public
-  encode zstd gzip
+{
+  auto_https off
+}
 
-  # Serve static files directly
-  @static path /build/* /images/* /favicon.ico /robots.txt /storage/*
-  handle @static {
-    file_server
-  }
-
-  @httpOnly expression `{env.TLS_MODE} == "http"`
-  @internalTls expression `{env.TLS_MODE} == "internal"`
-
-  handle @httpOnly {
-    tls off
-    reverse_proxy waypoint-app:9000
-  }
-
-  handle @internalTls {
-    tls internal
-    reverse_proxy waypoint-app:9000
-  }
-
-  reverse_proxy waypoint-app:9000
+http://{$CADDY_DOMAIN} {
+  reverse_proxy waypoint-web:8080
 }
