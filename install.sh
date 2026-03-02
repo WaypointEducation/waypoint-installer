@@ -4,9 +4,6 @@ set -euo pipefail
 STACK_DIR="/opt/waypoint/stack"
 DATA_DIR="/opt/waypoint/data"
 
-# GitHub raw base for waypoint-installer templates
-INSTALLER_RAW_BASE="https://raw.githubusercontent.com/WaypointEducation/waypoint-installer/main"
-
 # -----------------------------
 # helpers
 # -----------------------------
@@ -42,12 +39,6 @@ is_domain_like() {
 
 is_slug_like() {
   [[ "$1" =~ ^[a-z0-9]+([a-z0-9-]*[a-z0-9])?$ ]]
-}
-
-download_file() {
-  local url="$1"
-  local dest="$2"
-  curl -fsSL "$url" -o "$dest" || die "Failed to download: $url"
 }
 
 # -----------------------------
@@ -109,7 +100,7 @@ maybe_overwrite_existing_stack() {
 }
 
 # -----------------------------
-# config / prompts
+# prompts (HTTP only)
 # -----------------------------
 prompt_inputs() {
   clear || true
@@ -123,17 +114,9 @@ Installs to:
   /opt/waypoint/stack   (compose.yml, .env, Caddyfile, nginx.conf)
   /opt/waypoint/data    (MariaDB, Redis, Laravel storage)
 
-Components:
-  - Waypoint app (php-fpm)
-  - Waypoint web (nginx, serves /public including /build)
-  - MariaDB
-  - Redis
-  - Caddy (reverse proxy)
-
 Mode:
   - HTTP ONLY (no TLS) for now.
 ============================================================
-
 BANNER
 
   echo "Tenant details"
@@ -155,18 +138,13 @@ BANNER
   is_domain_like "${TENANT_BASE_DOMAIN}" || die "Base domain looks invalid: ${TENANT_BASE_DOMAIN}"
 
   CADDY_DOMAIN="${TENANT_SUBDOMAIN}.${TENANT_BASE_DOMAIN}"
-
-  echo
-  echo "Your tenant URL will be:"
-  echo "  http://${CADDY_DOMAIN}"
-  echo
-
-  # HTTP-only mode
-  TLS_MODE="http"
-  CADDY_EMAIL=""
   APP_URL="http://${CADDY_DOMAIN}"
 
   echo
+  echo "Your tenant URL will be:"
+  echo "  ${APP_URL}"
+  echo
+
   echo "Database credentials:"
   echo "  A) Auto-generate secure credentials (recommended)"
   echo "  B) I will provide DB username/password"
@@ -193,7 +171,6 @@ BANNER
   WAYPOINT_APP_IMAGE="ghcr.io/waypointeducation/waypoint:stable"
   APP_ENV="production"
   APP_DEBUG="false"
-  APP_KEY=""
 
   DB_CONNECTION="mysql"
   DB_HOST="mariadb"
@@ -206,6 +183,11 @@ BANNER
   CACHE_DRIVER="redis"
   QUEUE_CONNECTION="redis"
   SESSION_DRIVER="redis"
+
+  # HTTP only
+  TLS_MODE="http"
+  CADDY_EMAIL=""
+  APP_KEY=""
 }
 
 show_plan_and_confirm() {
@@ -238,29 +220,188 @@ show_plan_and_confirm() {
 }
 
 # -----------------------------
-# write stack files
+# write stack files (INLINE, NO DOWNLOADS)
 # -----------------------------
-download_stack_templates() {
-  log "Downloading stack templates from GitHub"
+write_stack_files() {
+  log "Writing stack files"
 
-  # These MUST exist in waypoint-installer repo:
-  # templates/compose.yml
-  # templates/Caddyfile
-  # templates/nginx.conf
-  download_file "${INSTALLER_RAW_BASE}/templates/compose.yml" "${STACK_DIR}/compose.yml"
-  download_file "${INSTALLER_RAW_BASE}/templates/Caddyfile"  "${STACK_DIR}/Caddyfile"
-  download_file "${INSTALLER_RAW_BASE}/templates/nginx.conf" "${STACK_DIR}/nginx.conf"
+  cat > "${STACK_DIR}/compose.yml" <<'YAML'
+services:
+  waypoint-app:
+    image: ${WAYPOINT_APP_IMAGE}
+    env_file:
+      - .env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - /opt/waypoint/data/storage:/var/www/html/storage
+    restart: unless-stopped
+
+  waypoint-web:
+    image: ${WAYPOINT_APP_IMAGE}
+    depends_on:
+      - waypoint-app
+    # Run nginx in the same image, but with OUR nginx.conf
+    command: ["nginx", "-g", "daemon off;"]
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - /opt/waypoint/data/storage:/var/www/html/storage
+    restart: unless-stopped
+
+  waypoint-queue:
+    image: ${WAYPOINT_APP_IMAGE}
+    env_file:
+      - .env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - /opt/waypoint/data/storage:/var/www/html/storage
+    command: ["php", "artisan", "queue:work", "--sleep=1", "--tries=1"]
+    restart: unless-stopped
+
+  waypoint-scheduler:
+    image: ${WAYPOINT_APP_IMAGE}
+    env_file:
+      - .env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - /opt/waypoint/data/storage:/var/www/html/storage
+    command: ["sh", "-lc", "while true; do php artisan schedule:run --no-interaction; sleep 60; done"]
+    restart: unless-stopped
+
+  mariadb:
+    image: mariadb:11
+    environment:
+      MARIADB_DATABASE: ${DB_DATABASE}
+      MARIADB_USER: ${DB_USERNAME}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - /opt/waypoint/data/mariadb:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -p$${MARIADB_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - /opt/waypoint/data/redis:/data
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - waypoint-web
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
+YAML
+
+  # Full nginx.conf (NOT a conf.d snippet) so "server" is always valid
+  cat > "${STACK_DIR}/nginx.conf" <<'NGINX'
+worker_processes auto;
+pid /tmp/nginx.pid;
+
+events {
+  worker_connections 1024;
 }
 
-write_env_file() {
-  log "Writing .env"
+http {
+  include       /etc/nginx/mime.types;
+  default_type  application/octet-stream;
+
+  access_log /dev/stdout;
+  error_log  /dev/stderr warn;
+
+  sendfile on;
+  keepalive_timeout 65;
+
+  client_body_temp_path /tmp/client_temp;
+  proxy_temp_path       /tmp/proxy_temp;
+  fastcgi_temp_path     /tmp/fastcgi_temp;
+  uwsgi_temp_path       /tmp/uwsgi_temp;
+  scgi_temp_path        /tmp/scgi_temp;
+
+  server {
+    listen 8080;
+    server_name _;
+
+    root /var/www/html/public;
+    index index.php;
+
+    # Serve built assets directly (correct MIME types + no Laravel HTML fallback)
+    location ^~ /build/ {
+      access_log off;
+      expires 7d;
+      add_header Cache-Control "public, max-age=604800, immutable";
+      try_files $uri =404;
+    }
+
+    # Serve common static files directly
+    location ~* \.(?:css|js|mjs|map|png|jpg|jpeg|gif|svg|webp|ico|ttf|otf|woff|woff2)$ {
+      access_log off;
+      expires 7d;
+      add_header Cache-Control "public, max-age=604800";
+      try_files $uri =404;
+    }
+
+    location / {
+      try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~ \.php$ {
+      include fastcgi_params;
+      fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+      fastcgi_param DOCUMENT_ROOT $document_root;
+      fastcgi_param HTTP_HOST $host;
+      fastcgi_pass waypoint-app:9000;
+    }
+
+    client_max_body_size 50m;
+  }
+}
+NGINX
+
+  # Caddy HTTP only, no redirects
+  cat > "${STACK_DIR}/Caddyfile" <<CADDY
+{
+  auto_https off
+}
+
+:80 {
+  reverse_proxy waypoint-web:8080
+}
+CADDY
+
+  # Write a COMPLETE .env so DB_PASSWORD is never blank
   cat > "${STACK_DIR}/.env" <<EOF
 WAYPOINT_APP_IMAGE=${WAYPOINT_APP_IMAGE}
 
 APP_ENV=${APP_ENV}
 APP_DEBUG=${APP_DEBUG}
 APP_URL=${APP_URL}
-APP_KEY=${APP_KEY}
+APP_KEY=
 
 DB_CONNECTION=${DB_CONNECTION}
 DB_HOST=${DB_HOST}
@@ -278,9 +419,9 @@ CACHE_DRIVER=${CACHE_DRIVER}
 QUEUE_CONNECTION=${QUEUE_CONNECTION}
 SESSION_DRIVER=${SESSION_DRIVER}
 
-CADDY_EMAIL=${CADDY_EMAIL}
+CADDY_EMAIL=
 CADDY_DOMAIN=${CADDY_DOMAIN}
-TLS_MODE=${TLS_MODE}
+TLS_MODE=http
 
 TENANT_ID=${TENANT_ID}
 TENANT_NAME=${TENANT_NAME}
@@ -291,25 +432,14 @@ EOF
   chmod 600 "${STACK_DIR}/.env"
 }
 
-write_stack_files() {
-  log "Writing stack files"
-  download_stack_templates
-  write_env_file
-}
-
 # -----------------------------
 # bring up stack + init
 # -----------------------------
-dc() {
-  # always run compose with explicit env file
-  docker compose --env-file "${STACK_DIR}/.env" "$@"
-}
-
 compose_up() {
   log "Starting services"
   cd "${STACK_DIR}"
-  dc pull
-  dc up -d
+  docker compose pull
+  docker compose up -d
 }
 
 detect_and_set_storage_perms() {
@@ -317,8 +447,9 @@ detect_and_set_storage_perms() {
   cd "${STACK_DIR}"
 
   local uid gid
-  uid="$(dc exec -T waypoint-app id -u)"
-  gid="$(dc exec -T waypoint-app id -g)"
+  uid="$(docker compose exec -T waypoint-app id -u)"
+  gid="$(docker compose exec -T waypoint-app id -g)"
+
   [[ -n "${uid}" && -n "${gid}" ]] || die "Could not detect container uid/gid."
 
   chown -R "${uid}:${gid}" "${DATA_DIR}/storage" || true
@@ -331,24 +462,24 @@ generate_app_key_in_container() {
   cd "${STACK_DIR}"
 
   local key
-  key="$(dc exec -T waypoint-app php -r "echo 'base64:'.base64_encode(random_bytes(32)).PHP_EOL;")"
+  key="$(docker compose exec -T waypoint-app php -r "echo 'base64:'.base64_encode(random_bytes(32)).PHP_EOL;")"
   [[ -n "${key}" ]] || die "Failed to generate APP_KEY."
 
   sed -i "s|^APP_KEY=.*$|APP_KEY=${key}|" "${STACK_DIR}/.env"
-  dc up -d
+  docker compose up -d
 }
 
 run_migrations() {
   log "Running central migrations"
   cd "${STACK_DIR}"
-  dc exec -T waypoint-app php artisan migrate --force
+  docker compose exec -T waypoint-app php artisan migrate --force
 }
 
 create_first_tenant() {
   log "Creating initial tenant (${TENANT_ID}) and running tenant migrations"
   cd "${STACK_DIR}"
 
-  dc exec -T waypoint-app php artisan make:tenant "${TENANT_ID}" \
+  docker compose exec -T waypoint-app php artisan make:tenant "${TENANT_ID}" \
     --name="${TENANT_NAME}" \
     --subdomain="${TENANT_SUBDOMAIN}" \
     --base-domain="${TENANT_BASE_DOMAIN}" \
@@ -372,7 +503,7 @@ print_summary() {
   echo "Next:"
   echo "  1) Browse to: ${APP_URL}"
   echo "  2) Admin commands:"
-  echo "     cd ${STACK_DIR} && docker compose --env-file .env exec waypoint-app php artisan <command>"
+  echo "     cd ${STACK_DIR} && docker compose exec waypoint-app php artisan <command>"
   echo
   echo "NOTE:"
   echo "  This installer deploys HTTP only."
