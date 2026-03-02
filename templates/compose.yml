@@ -8,8 +8,10 @@ services:
     environment:
       CADDY_EMAIL: ${CADDY_EMAIL}
       CADDY_DOMAIN: ${CADDY_DOMAIN}
+      TLS_MODE: ${TLS_MODE}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - waypoint_public:/srv/public:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
@@ -37,8 +39,15 @@ services:
       CACHE_DRIVER: ${CACHE_DRIVER}
       QUEUE_CONNECTION: ${QUEUE_CONNECTION}
       SESSION_DRIVER: ${SESSION_DRIVER}
+
+      # Tenancy (if you’re using these in the app)
+      TENANT_ID: ${TENANT_ID}
+      TENANT_NAME: ${TENANT_NAME}
+      TENANT_SUBDOMAIN: ${TENANT_SUBDOMAIN}
+      TENANT_BASE_DOMAIN: ${TENANT_BASE_DOMAIN}
     volumes:
       - /opt/waypoint/data/storage:/var/www/html/storage
+      - waypoint_public:/var/www/html/public
     depends_on:
       mariadb:
         condition: service_healthy
@@ -51,6 +60,7 @@ services:
     environment: *waypoint_env
     volumes:
       - /opt/waypoint/data/storage:/var/www/html/storage
+      - waypoint_public:/var/www/html/public
     depends_on:
       mariadb:
         condition: service_healthy
@@ -64,6 +74,7 @@ services:
     environment: *waypoint_env
     volumes:
       - /opt/waypoint/data/storage:/var/www/html/storage
+      - waypoint_public:/var/www/html/public
     depends_on:
       mariadb:
         condition: service_healthy
@@ -82,7 +93,7 @@ services:
     volumes:
       - /opt/waypoint/data/mariadb:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mariadb-admin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD}"]
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -p$${MARIADB_ROOT_PASSWORD} --silent"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -97,3 +108,4 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  waypoint_public:
