@@ -3,5 +3,5 @@
 }
 
 http://{$CADDY_DOMAIN} {
-  reverse_proxy waypoint-web:8080
+  reverse_proxy waypoint-web:80
 }
