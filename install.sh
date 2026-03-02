@@ -4,10 +4,11 @@ set -euo pipefail
 STACK_DIR="/opt/waypoint/stack"
 DATA_DIR="/opt/waypoint/data"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Where we temporarily download templates (because install.sh is curl'd as a single file)
+TEMPLATES_DIR="${STACK_DIR}/.templates"
 
-TEMPLATES_DIR="${SCRIPT_DIR}/templates"
-NGINX_TEMPLATE="${SCRIPT_DIR}/docker/nginx/default.conf"
+# GitHub raw base (pin this to a tag/commit later if you want fully reproducible installs)
+INSTALLER_RAW_BASE="https://raw.githubusercontent.com/WaypointEducation/waypoint-installer/main"
 
 # -----------------------------
 # helpers
@@ -46,14 +47,17 @@ is_slug_like() {
   [[ "$1" =~ ^[a-z0-9]+([a-z0-9-]*[a-z0-9])?$ ]]
 }
 
-dns_resolves() {
-  local host="$1"
-  getent ahosts "$host" >/dev/null 2>&1
-}
-
 need_file() {
   local f="$1"
   [[ -f "$f" ]] || die "Missing required file: $f"
+}
+
+download_file() {
+  local url="$1"
+  local dest="$2"
+
+  # -f fail on HTTP errors, -S show errors, -L follow redirects
+  curl -fsSL "$url" -o "$dest" || die "Failed to download: $url"
 }
 
 # -----------------------------
@@ -102,6 +106,7 @@ ensure_dirs() {
   mkdir -p "${DATA_DIR}/"{mariadb,redis,storage}
   mkdir -p "${DATA_DIR}/storage"/logs
   mkdir -p "${DATA_DIR}/storage"/framework/{cache,sessions,views}
+  mkdir -p "${TEMPLATES_DIR}"
 }
 
 maybe_overwrite_existing_stack() {
@@ -112,6 +117,29 @@ maybe_overwrite_existing_stack() {
     echo
     confirm "Overwrite existing stack files in ${STACK_DIR}?" || die "Cancelled by user."
   fi
+}
+
+# -----------------------------
+# download templates (runtime)
+# -----------------------------
+fetch_templates() {
+  log "Downloading installer templates from GitHub"
+
+  # Template destinations
+  local compose_t="${TEMPLATES_DIR}/compose.yml"
+  local env_t="${TEMPLATES_DIR}/env.example"
+  local caddy_http_t="${TEMPLATES_DIR}/Caddyfile.http"
+  local nginx_t="${TEMPLATES_DIR}/nginx.default.conf"
+
+  download_file "${INSTALLER_RAW_BASE}/templates/compose.yml" "${compose_t}"
+  download_file "${INSTALLER_RAW_BASE}/templates/env.example" "${env_t}"
+  download_file "${INSTALLER_RAW_BASE}/templates/Caddyfile.http" "${caddy_http_t}"
+  download_file "${INSTALLER_RAW_BASE}/docker/nginx/default.conf" "${nginx_t}"
+
+  need_file "${compose_t}"
+  need_file "${env_t}"
+  need_file "${caddy_http_t}"
+  need_file "${nginx_t}"
 }
 
 # -----------------------------
@@ -131,15 +159,13 @@ Installs to:
 
 Components:
   - Waypoint app (php-fpm)
-  - Nginx (serves static assets + forwards PHP to php-fpm)
+  - Waypoint web (nginx inside same image, serves /public including /build)
   - MariaDB
   - Redis
   - Caddy (reverse proxy)
 
-IMPORTANT (current testing mode):
-  - TLS selection is collected, but for now we deploy HTTP only.
-    We'll switch the Caddyfile templates to real TLS when you
-    production-test the full flow.
+Mode:
+  - HTTP ONLY (no TLS) for now.
 ============================================================
 
 BANNER
@@ -169,42 +195,9 @@ BANNER
   echo "  http://${CADDY_DOMAIN}"
   echo
 
-  echo "TLS mode (collected for later):"
-  echo "  1) Let's Encrypt (production)"
-  echo "  2) Internal TLS (local)"
-  echo "  3) HTTP only (local)"
-  echo
-  read -rp "Choose TLS mode [1/2/3] (default 3): " TLS_CHOICE
-  TLS_CHOICE="${TLS_CHOICE:-3}"
-
-  case "${TLS_CHOICE}" in
-    1)
-      TLS_MODE="letsencrypt"
-      read -rp "Email for Let's Encrypt (e.g. it@school.edu.au): " CADDY_EMAIL
-      [[ -n "${CADDY_EMAIL}" ]] || die "Email is required for Let's Encrypt."
-      ;;
-    2)
-      TLS_MODE="internal"
-      CADDY_EMAIL=""
-      ;;
-    3)
-      TLS_MODE="http"
-      CADDY_EMAIL=""
-      ;;
-    *)
-      die "Invalid TLS mode choice: ${TLS_CHOICE}"
-      ;;
-  esac
-
-  if [[ "${TLS_MODE}" == "letsencrypt" ]]; then
-    echo
-    echo "Checking public DNS for ${CADDY_DOMAIN}..."
-    if ! dns_resolves "${CADDY_DOMAIN}"; then
-      die "Public DNS does not resolve for ${CADDY_DOMAIN}. For local testing, choose Internal TLS or HTTP."
-    fi
-  fi
-
-  # For now, always HTTP to stop churn while you test the installer flow.
+  # HTTP-only
+  TLS_MODE="http"
+  CADDY_EMAIL=""
   APP_URL="http://${CADDY_DOMAIN}"
 
   echo
@@ -260,7 +253,7 @@ show_plan_and_confirm() {
   echo "  Name:          ${TENANT_NAME}"
   echo "  Domain:        ${CADDY_DOMAIN}"
   echo
-  echo "TLS mode chosen: ${TLS_MODE} (NOTE: deploying HTTP only for now)"
+  echo "Mode:            HTTP only"
   echo "App URL:         ${APP_URL}"
   echo
   echo "DB database:     ${DB_DATABASE}"
@@ -280,10 +273,9 @@ show_plan_and_confirm() {
 }
 
 # -----------------------------
-# write stack files from repo templates
+# write stack files from downloaded templates
 # -----------------------------
 render_template() {
-  # very small envsubst-like renderer (safe for our simple placeholders)
   # Usage: render_template <src> <dest>
   local src="$1"
   local dest="$2"
@@ -316,19 +308,22 @@ render_template() {
 write_stack_files() {
   log "Writing stack files"
 
-  need_file "${TEMPLATES_DIR}/compose.yml"
-  need_file "${TEMPLATES_DIR}/env.example"
-  need_file "${TEMPLATES_DIR}/Caddyfile.http"
-  need_file "${NGINX_TEMPLATE}"
+  local compose_t="${TEMPLATES_DIR}/compose.yml"
+  local env_t="${TEMPLATES_DIR}/env.example"
+  local caddy_http_t="${TEMPLATES_DIR}/Caddyfile.http"
+  local nginx_t="${TEMPLATES_DIR}/nginx.default.conf"
 
-  render_template "${TEMPLATES_DIR}/compose.yml" "${STACK_DIR}/compose.yml"
-  render_template "${TEMPLATES_DIR}/env.example" "${STACK_DIR}/.env"
+  need_file "${compose_t}"
+  need_file "${env_t}"
+  need_file "${caddy_http_t}"
+  need_file "${nginx_t}"
 
-  # Force HTTP Caddyfile for now (testing mode)
-  render_template "${TEMPLATES_DIR}/Caddyfile.http" "${STACK_DIR}/Caddyfile"
+  render_template "${compose_t}" "${STACK_DIR}/compose.yml"
+  render_template "${env_t}" "${STACK_DIR}/.env"
+  render_template "${caddy_http_t}" "${STACK_DIR}/Caddyfile"
 
-  # nginx default.conf -> nginx.conf in stack dir
-  cp -f "${NGINX_TEMPLATE}" "${STACK_DIR}/nginx.conf"
+  # nginx template is already final, no placeholders needed
+  cp -f "${nginx_t}" "${STACK_DIR}/nginx.conf"
 
   chmod 600 "${STACK_DIR}/.env"
 }
@@ -407,7 +402,7 @@ print_summary() {
   echo "     cd ${STACK_DIR} && docker compose exec waypoint-app php artisan <command>"
   echo
   echo "NOTE:"
-  echo "  TLS selection is collected but HTTP is forced for this installer build."
+  echo "  This installer deploys HTTP only."
 }
 
 main() {
@@ -417,6 +412,8 @@ main() {
   install_docker
   ensure_compose
   ensure_dirs
+
+  fetch_templates
 
   prompt_inputs
   show_plan_and_confirm
