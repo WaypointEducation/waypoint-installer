@@ -1,12 +1,87 @@
 services:
+  waypoint-app:
+    image: ${WAYPOINT_APP_IMAGE}
+    env_file:
+      - .env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      # Ensure Laravel uses phpredis
+      REDIS_CLIENT: phpredis
+      # Where the entrypoint copies public/ to
+      SHARED_PUBLIC: /shared/public
+    volumes:
+      - /opt/waypoint/data/storage:/var/www/html/storage
+      - waypoint_public:/shared/public
+    restart: unless-stopped
+
+  waypoint-queue:
+    image: ${WAYPOINT_APP_IMAGE}
+    env_file:
+      - .env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      REDIS_CLIENT: phpredis
+      SHARED_PUBLIC: /shared/public
+    volumes:
+      - /opt/waypoint/data/storage:/var/www/html/storage
+      - waypoint_public:/shared/public
+    command: ["php", "artisan", "queue:work", "--sleep=1", "--tries=3", "--timeout=120"]
+    restart: unless-stopped
+
+  waypoint-scheduler:
+    image: ${WAYPOINT_APP_IMAGE}
+    env_file:
+      - .env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      REDIS_CLIENT: phpredis
+      SHARED_PUBLIC: /shared/public
+    volumes:
+      - /opt/waypoint/data/storage:/var/www/html/storage
+      - waypoint_public:/shared/public
+    command: ["sh", "-lc", "while true; do php artisan schedule:run --no-interaction; sleep 60; done"]
+    restart: unless-stopped
+
+  mariadb:
+    image: mariadb:11
+    environment:
+      MARIADB_DATABASE: ${DB_DATABASE}
+      MARIADB_USER: ${DB_USERNAME}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - /opt/waypoint/data/mariadb:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -p$${MARIADB_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - /opt/waypoint/data/redis:/data
+    restart: unless-stopped
+
   caddy:
     image: caddy:2-alpine
-    restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
     environment:
-      CADDY_EMAIL: ${CADDY_EMAIL}
       CADDY_DOMAIN: ${CADDY_DOMAIN}
       TLS_MODE: ${TLS_MODE}
     volumes:
@@ -16,95 +91,9 @@ services:
       - caddy_config:/config
     depends_on:
       - waypoint-app
-
-  waypoint-app:
-    image: ${WAYPOINT_APP_IMAGE}
     restart: unless-stopped
-    environment: &waypoint_env
-      APP_ENV: ${APP_ENV}
-      APP_DEBUG: ${APP_DEBUG}
-      APP_URL: ${APP_URL}
-      APP_KEY: ${APP_KEY}
-
-      DB_CONNECTION: ${DB_CONNECTION}
-      DB_HOST: ${DB_HOST}
-      DB_PORT: ${DB_PORT}
-      DB_DATABASE: ${DB_DATABASE}
-      DB_USERNAME: ${DB_USERNAME}
-      DB_PASSWORD: ${DB_PASSWORD}
-
-      REDIS_HOST: ${REDIS_HOST}
-      REDIS_PORT: ${REDIS_PORT}
-
-      CACHE_DRIVER: ${CACHE_DRIVER}
-      QUEUE_CONNECTION: ${QUEUE_CONNECTION}
-      SESSION_DRIVER: ${SESSION_DRIVER}
-
-      TENANT_ID: ${TENANT_ID}
-      TENANT_NAME: ${TENANT_NAME}
-      TENANT_SUBDOMAIN: ${TENANT_SUBDOMAIN}
-      TENANT_BASE_DOMAIN: ${TENANT_BASE_DOMAIN}
-    volumes:
-      - /opt/waypoint/data/storage:/var/www/html/storage
-      - waypoint_public:/var/www/html/public
-    depends_on:
-      mariadb:
-        condition: service_healthy
-      redis:
-        condition: service_started
-
-  waypoint-queue:
-    image: ${WAYPOINT_APP_IMAGE}
-    restart: unless-stopped
-    environment: *waypoint_env
-    volumes:
-      - /opt/waypoint/data/storage:/var/www/html/storage
-      - waypoint_public:/var/www/html/public
-    depends_on:
-      mariadb:
-        condition: service_healthy
-      redis:
-        condition: service_started
-    command: ["php", "artisan", "queue:work", "--sleep=1", "--tries=3", "--timeout=120"]
-
-  waypoint-scheduler:
-    image: ${WAYPOINT_APP_IMAGE}
-    restart: unless-stopped
-    environment: *waypoint_env
-    volumes:
-      - /opt/waypoint/data/storage:/var/www/html/storage
-      - waypoint_public:/var/www/html/public
-    depends_on:
-      mariadb:
-        condition: service_healthy
-      redis:
-        condition: service_started
-    command: ["/bin/sh", "-lc", "while true; do php artisan schedule:run --no-interaction; sleep 60; done"]
-
-  mariadb:
-    image: mariadb:11
-    restart: unless-stopped
-    environment:
-      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MARIADB_DATABASE: ${DB_DATABASE}
-      MARIADB_USER: ${DB_USERNAME}
-      MARIADB_PASSWORD: ${DB_PASSWORD}
-    volumes:
-      - /opt/waypoint/data/mariadb:/var/lib/mysql
-    healthcheck:
-      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -p$${MARIADB_ROOT_PASSWORD} --silent"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes:
-      - /opt/waypoint/data/redis:/data
 
 volumes:
+  waypoint_public:
   caddy_data:
   caddy_config:
-  waypoint_public:
