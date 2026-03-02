@@ -16,28 +16,23 @@ services:
     restart: unless-stopped
 
   # -----------------------------
-  # One-shot: populate /public volume from the Waypoint image
-  # This ensures nginx can serve /public/build assets correctly.
-  # -----------------------------
-  waypoint-public-init:
-    image: ${WAYPOINT_APP_IMAGE}
-    command: ["sh", "-lc", "rm -rf /public/* && cp -a /var/www/html/public/. /public/"]
-    volumes:
-      - waypoint_public:/public
-    restart: "no"
-
-  # -----------------------------
-  # Web (Nginx)
-  # Serves /public (including /build) and forwards PHP to waypoint-app:9000
+  # Web (Nginx running inside the Waypoint image)
+  # - serves /public (including /build assets)
+  # - forwards PHP to waypoint-app:9000
   # -----------------------------
   waypoint-web:
-    image: nginx:1.27-alpine
+    image: ${WAYPOINT_APP_IMAGE}
+    env_file:
+      - .env
     depends_on:
       - waypoint-app
-      - waypoint-public-init
+    user: "0:0"
+    command: ["nginx", "-g", "daemon off;"]
     volumes:
-      - waypoint_public:/var/www/html/public:ro
+      # Your server{} config must be mounted as a conf.d file (NOT nginx.conf)
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # Optional but harmless: allow same persistent storage visibility
+      - /opt/waypoint/data/storage:/var/www/html/storage
     restart: unless-stopped
 
   # -----------------------------
@@ -123,6 +118,5 @@ services:
     restart: unless-stopped
 
 volumes:
-  waypoint_public:
   caddy_data:
   caddy_config:
