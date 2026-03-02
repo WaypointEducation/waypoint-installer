@@ -1,4 +1,5 @@
 services:
+  # PHP-FPM (Laravel)
   waypoint-app:
     image: ${WAYPOINT_APP_IMAGE}
     env_file:
@@ -8,14 +9,16 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
-    environment:
-      # Ensure Laravel uses phpredis
-      REDIS_CLIENT: phpredis
-      # Where the entrypoint copies public/ to
-      SHARED_PUBLIC: /shared/public
     volumes:
       - /opt/waypoint/data/storage:/var/www/html/storage
-      - waypoint_public:/shared/public
+    restart: unless-stopped
+
+  # Nginx (serves /public including /build; forwards PHP to waypoint-app:9000)
+  waypoint-web:
+    image: ${WAYPOINT_APP_IMAGE}
+    depends_on:
+      - waypoint-app
+    command: ["nginx", "-g", "daemon off;"]
     restart: unless-stopped
 
   waypoint-queue:
@@ -27,13 +30,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
-    environment:
-      REDIS_CLIENT: phpredis
-      SHARED_PUBLIC: /shared/public
     volumes:
       - /opt/waypoint/data/storage:/var/www/html/storage
-      - waypoint_public:/shared/public
-    command: ["php", "artisan", "queue:work", "--sleep=1", "--tries=3", "--timeout=120"]
+    command: ["php", "artisan", "queue:work", "--sleep=1", "--tries=1"]
     restart: unless-stopped
 
   waypoint-scheduler:
@@ -45,12 +44,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
-    environment:
-      REDIS_CLIENT: phpredis
-      SHARED_PUBLIC: /shared/public
     volumes:
       - /opt/waypoint/data/storage:/var/www/html/storage
-      - waypoint_public:/shared/public
     command: ["sh", "-lc", "while true; do php artisan schedule:run --no-interaction; sleep 60; done"]
     restart: unless-stopped
 
@@ -82,18 +77,17 @@ services:
       - "80:80"
       - "443:443"
     environment:
+      CADDY_EMAIL: ${CADDY_EMAIL}
       CADDY_DOMAIN: ${CADDY_DOMAIN}
       TLS_MODE: ${TLS_MODE}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - waypoint_public:/srv/public:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
-      - waypoint-app
+      - waypoint-web
     restart: unless-stopped
 
 volumes:
-  waypoint_public:
   caddy_data:
   caddy_config:
