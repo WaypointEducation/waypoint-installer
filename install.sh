@@ -128,12 +128,12 @@ fetch_templates() {
   # Template destinations
   local compose_t="${TEMPLATES_DIR}/compose.yml"
   local env_t="${TEMPLATES_DIR}/env.example"
-  local caddy_http_t="${TEMPLATES_DIR}/Caddyfile.http"
+  local caddy_http_t="${TEMPLATES_DIR}/Caddyfile"
   local nginx_t="${TEMPLATES_DIR}/nginx.default.conf"
 
   download_file "${INSTALLER_RAW_BASE}/templates/compose.yml" "${compose_t}"
   download_file "${INSTALLER_RAW_BASE}/templates/env.example" "${env_t}"
-  download_file "${INSTALLER_RAW_BASE}/templates/Caddyfile.http" "${caddy_http_t}"
+  download_file "${INSTALLER_RAW_BASE}/templates/Caddyfile" "${caddy_http_t}"
   download_file "${INSTALLER_RAW_BASE}/docker/nginx/default.conf" "${nginx_t}"
 
   need_file "${compose_t}"
@@ -310,7 +310,7 @@ write_stack_files() {
 
   local compose_t="${TEMPLATES_DIR}/compose.yml"
   local env_t="${TEMPLATES_DIR}/env.example"
-  local caddy_http_t="${TEMPLATES_DIR}/Caddyfile.http"
+  local caddy_http_t="${TEMPLATES_DIR}/Caddyfile"
   local nginx_t="${TEMPLATES_DIR}/nginx.default.conf"
 
   need_file "${compose_t}"
