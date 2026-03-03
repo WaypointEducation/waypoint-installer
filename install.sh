@@ -193,11 +193,11 @@ BANNER
   REDIS_PORT="6379"
 
   CACHE_DRIVER="redis"
-  CACHE_STORE="redis"
   QUEUE_CONNECTION="redis"
   SESSION_DRIVER="redis"
 
   TLS_MODE="http"
+  CADDY_EMAIL=""
   APP_KEY=""
 }
 
@@ -249,6 +249,7 @@ write_stack_files() {
   install -m 0644 "${TEMPLATE_DIR}/compose.yml" "${STACK_DIR}/compose.yml"
   install -m 0644 "${TEMPLATE_DIR}/nginx.conf"  "${STACK_DIR}/nginx.conf"
   install -m 0644 "${TEMPLATE_DIR}/Caddyfile"   "${STACK_DIR}/Caddyfile"
+
   install -m 0600 "${TEMPLATE_DIR}/env.example" "${STACK_DIR}/.env"
 
   require_env_key "WAYPOINT_APP_IMAGE"
@@ -297,23 +298,12 @@ write_stack_files() {
   set_env_key "QUEUE_CONNECTION" "${QUEUE_CONNECTION}"
   set_env_key "SESSION_DRIVER" "${SESSION_DRIVER}"
 
-  if grep -qE '^CACHE_STORE=' "${STACK_DIR}/.env"; then
-    set_env_key "CACHE_STORE" "${CACHE_STORE}"
-  else
-    echo "CACHE_STORE=${CACHE_STORE}" >> "${STACK_DIR}/.env"
-  fi
-
-  if grep -qE '^TLS_MODE=' "${STACK_DIR}/.env"; then
-    set_env_key "TLS_MODE" "${TLS_MODE}"
-  else
-    echo "TLS_MODE=${TLS_MODE}" >> "${STACK_DIR}/.env"
-  fi
-
   set_env_key "CADDY_DOMAIN" "${CADDY_DOMAIN}"
 
   chmod 600 "${STACK_DIR}/.env"
 }
 
+# NEW: storage scaffolding (central + tenant + livewire tmp)
 ensure_storage_layout() {
   log "Ensuring storage directories exist"
 
@@ -321,6 +311,7 @@ ensure_storage_layout() {
   mkdir -p "${DATA_DIR}/storage"/logs
   mkdir -p "${DATA_DIR}/storage"/app/livewire-tmp
 
+  # Tenant-scoped paths
   mkdir -p "${DATA_DIR}/storage/${TENANT_ID}"/framework/{cache,sessions,views}
   mkdir -p "${DATA_DIR}/storage/${TENANT_ID}"/logs
   mkdir -p "${DATA_DIR}/storage/${TENANT_ID}"/app/livewire-tmp
@@ -416,14 +407,16 @@ main() {
 
   write_stack_files
 
+  # NEW: create dirs before the stack starts
   ensure_storage_layout
+
   compose_up
   detect_and_set_storage_perms
-
   generate_app_key_in_container
   run_migrations
   create_first_tenant
 
+  # NEW: re-run (safe) after tenant exists
   ensure_storage_layout
   detect_and_set_storage_perms
 
