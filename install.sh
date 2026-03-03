@@ -4,6 +4,10 @@ set -euo pipefail
 STACK_DIR="/opt/waypoint/stack"
 DATA_DIR="/opt/waypoint/data"
 
+REPO_OWNER="WaypointEducation"
+REPO_NAME="waypoint-installer"
+REPO_BRANCH="main"
+
 # -----------------------------
 # helpers
 # -----------------------------
@@ -47,7 +51,7 @@ is_slug_like() {
 install_prereqs() {
   log "Installing prerequisites"
   apt-get update -y
-  apt-get install -y ca-certificates curl gnupg openssl git
+  apt-get install -y ca-certificates curl gnupg openssl git tar
 }
 
 install_docker() {
@@ -62,6 +66,7 @@ install_docker() {
   curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
 
+  # shellcheck disable=SC1091
   source /etc/os-release
   echo \
     "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
@@ -97,6 +102,30 @@ maybe_overwrite_existing_stack() {
     echo
     confirm "Overwrite existing stack files in ${STACK_DIR}?" || die "Cancelled by user."
   fi
+}
+
+# -----------------------------
+# pull templates from GitHub
+# -----------------------------
+fetch_templates() {
+  log "Fetching latest templates from GitHub (${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH})"
+
+  local tmp
+  tmp="$(mktemp -d)"
+
+  curl -fsSL "https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/heads/${REPO_BRANCH}" \
+    | tar -xz -C "$tmp"
+
+  TEMPLATE_DIR="$(find "$tmp" -maxdepth 3 -type d -name templates | head -n 1)"
+  [[ -d "${TEMPLATE_DIR}" ]] || die "Could not find templates/ in downloaded repo"
+
+  # Sanity check required template files
+  [[ -f "${TEMPLATE_DIR}/compose.yml" ]] || die "Missing templates/compose.yml in repo"
+  [[ -f "${TEMPLATE_DIR}/nginx.conf" ]] || die "Missing templates/nginx.conf in repo"
+  [[ -f "${TEMPLATE_DIR}/Caddyfile"  ]] || die "Missing templates/Caddyfile in repo"
+  [[ -f "${TEMPLATE_DIR}/env.example" ]] || die "Missing templates/env.example in repo"
+
+  export TEMPLATE_DIR
 }
 
 # -----------------------------
@@ -178,7 +207,6 @@ BANNER
 
   REDIS_HOST="redis"
   REDIS_PORT="6379"
-  REDIS_CLIENT="phpredis"
 
   CACHE_DRIVER="redis"
   QUEUE_CONNECTION="redis"
@@ -186,6 +214,8 @@ BANNER
 
   # HTTP only
   TLS_MODE="http"
+
+  # Use email from env.example as default (patched later if present)
   CADDY_EMAIL=""
   APP_KEY=""
 }
@@ -220,214 +250,82 @@ show_plan_and_confirm() {
 }
 
 # -----------------------------
-# write stack files (INLINE, NO DOWNLOADS)
+# write stack files (FROM TEMPLATES)
 # -----------------------------
+require_env_key() {
+  local key="$1"
+  grep -qE "^${key}=" "${STACK_DIR}/.env" || die "templates/env.example must include '${key}='"
+}
+
+set_env_key() {
+  local key="$1"
+  local value="$2"
+  # Replace existing line (assumes it's present); keep file POSIX-safe.
+  sed -i "s|^${key}=.*$|${key}=${value}|" "${STACK_DIR}/.env"
+}
+
 write_stack_files() {
-  log "Writing stack files"
+  log "Writing stack files (from templates/)"
 
-  cat > "${STACK_DIR}/compose.yml" <<'YAML'
-services:
-  waypoint-app:
-    image: ${WAYPOINT_APP_IMAGE}
-    env_file:
-      - .env
-    depends_on:
-      mariadb:
-        condition: service_healthy
-      redis:
-        condition: service_started
-    volumes:
-      - /opt/waypoint/data/storage:/var/www/html/storage
-    restart: unless-stopped
+  [[ -n "${TEMPLATE_DIR:-}" ]] || die "TEMPLATE_DIR not set (fetch_templates not called?)"
 
-  waypoint-web:
-    image: ${WAYPOINT_APP_IMAGE}
-    depends_on:
-      - waypoint-app
-    # Run nginx in the same image, but with OUR nginx.conf
-    command: ["nginx", "-g", "daemon off;"]
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - /opt/waypoint/data/storage:/var/www/html/storage
-    restart: unless-stopped
+  install -m 0644 "${TEMPLATE_DIR}/compose.yml" "${STACK_DIR}/compose.yml"
+  install -m 0644 "${TEMPLATE_DIR}/nginx.conf"  "${STACK_DIR}/nginx.conf"
+  install -m 0644 "${TEMPLATE_DIR}/Caddyfile"   "${STACK_DIR}/Caddyfile"
 
-  waypoint-queue:
-    image: ${WAYPOINT_APP_IMAGE}
-    env_file:
-      - .env
-    depends_on:
-      mariadb:
-        condition: service_healthy
-      redis:
-        condition: service_started
-    volumes:
-      - /opt/waypoint/data/storage:/var/www/html/storage
-    command: ["php", "artisan", "queue:work", "--sleep=1", "--tries=1"]
-    restart: unless-stopped
+  install -m 0600 "${TEMPLATE_DIR}/env.example" "${STACK_DIR}/.env"
 
-  waypoint-scheduler:
-    image: ${WAYPOINT_APP_IMAGE}
-    env_file:
-      - .env
-    depends_on:
-      mariadb:
-        condition: service_healthy
-      redis:
-        condition: service_started
-    volumes:
-      - /opt/waypoint/data/storage:/var/www/html/storage
-    command: ["sh", "-lc", "while true; do php artisan schedule:run --no-interaction; sleep 60; done"]
-    restart: unless-stopped
+  # Enforce required keys exist in env.example
+  require_env_key "WAYPOINT_APP_IMAGE"
+  require_env_key "APP_ENV"
+  require_env_key "APP_DEBUG"
+  require_env_key "APP_URL"
+  require_env_key "APP_KEY"
 
-  mariadb:
-    image: mariadb:11
-    environment:
-      MARIADB_DATABASE: ${DB_DATABASE}
-      MARIADB_USER: ${DB_USERNAME}
-      MARIADB_PASSWORD: ${DB_PASSWORD}
-      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-    volumes:
-      - /opt/waypoint/data/mariadb:/var/lib/mysql
-    healthcheck:
-      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -p$${MARIADB_ROOT_PASSWORD} --silent"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
-    restart: unless-stopped
+  require_env_key "DB_CONNECTION"
+  require_env_key "DB_HOST"
+  require_env_key "DB_PORT"
+  require_env_key "DB_DATABASE"
+  require_env_key "DB_USERNAME"
+  require_env_key "DB_PASSWORD"
+  require_env_key "MYSQL_ROOT_PASSWORD"
 
-  redis:
-    image: redis:7-alpine
-    volumes:
-      - /opt/waypoint/data/redis:/data
-    restart: unless-stopped
+  require_env_key "REDIS_HOST"
+  require_env_key "REDIS_PORT"
 
-  caddy:
-    image: caddy:2-alpine
-    ports:
-      - "80:80"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      - waypoint-web
-    restart: unless-stopped
+  require_env_key "CACHE_DRIVER"
+  require_env_key "QUEUE_CONNECTION"
+  require_env_key "SESSION_DRIVER"
 
-volumes:
-  caddy_data:
-  caddy_config:
-YAML
+  require_env_key "CADDY_EMAIL"
+  require_env_key "CADDY_DOMAIN"
 
-  # Full nginx.conf (NOT a conf.d snippet) so "server" is always valid
-  cat > "${STACK_DIR}/nginx.conf" <<'NGINX'
-worker_processes auto;
-pid /tmp/nginx.pid;
+  # Patch values gathered/generated by installer
+  set_env_key "WAYPOINT_APP_IMAGE" "${WAYPOINT_APP_IMAGE}"
 
-events {
-  worker_connections 1024;
-}
+  set_env_key "APP_ENV" "${APP_ENV}"
+  set_env_key "APP_DEBUG" "${APP_DEBUG}"
+  set_env_key "APP_URL" "${APP_URL}"
+  set_env_key "APP_KEY" ""
 
-http {
-  include       /etc/nginx/mime.types;
-  default_type  application/octet-stream;
+  set_env_key "DB_CONNECTION" "${DB_CONNECTION}"
+  set_env_key "DB_HOST" "${DB_HOST}"
+  set_env_key "DB_PORT" "${DB_PORT}"
+  set_env_key "DB_DATABASE" "${DB_DATABASE}"
+  set_env_key "DB_USERNAME" "${DB_USERNAME}"
+  set_env_key "DB_PASSWORD" "${DB_PASSWORD}"
+  set_env_key "MYSQL_ROOT_PASSWORD" "${MYSQL_ROOT_PASSWORD}"
 
-  access_log /dev/stdout;
-  error_log  /dev/stderr warn;
+  set_env_key "REDIS_HOST" "${REDIS_HOST}"
+  set_env_key "REDIS_PORT" "${REDIS_PORT}"
 
-  sendfile on;
-  keepalive_timeout 65;
+  set_env_key "CACHE_DRIVER" "${CACHE_DRIVER}"
+  set_env_key "QUEUE_CONNECTION" "${QUEUE_CONNECTION}"
+  set_env_key "SESSION_DRIVER" "${SESSION_DRIVER}"
 
-  client_body_temp_path /tmp/client_temp;
-  proxy_temp_path       /tmp/proxy_temp;
-  fastcgi_temp_path     /tmp/fastcgi_temp;
-  uwsgi_temp_path       /tmp/uwsgi_temp;
-  scgi_temp_path        /tmp/scgi_temp;
-
-  server {
-    listen 8080;
-    server_name _;
-
-    root /var/www/html/public;
-    index index.php;
-
-    # Serve built assets directly (correct MIME types + no Laravel HTML fallback)
-    location ^~ /build/ {
-      access_log off;
-      expires 7d;
-      add_header Cache-Control "public, max-age=604800, immutable";
-      try_files $uri =404;
-    }
-
-    # Serve common static files directly
-    location ~* \.(?:css|js|mjs|map|png|jpg|jpeg|gif|svg|webp|ico|ttf|otf|woff|woff2)$ {
-      access_log off;
-      expires 7d;
-      add_header Cache-Control "public, max-age=604800";
-      try_files $uri =404;
-    }
-
-    location / {
-      try_files $uri $uri/ /index.php?$query_string;
-    }
-
-    location ~ \.php$ {
-      include fastcgi_params;
-      fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-      fastcgi_param DOCUMENT_ROOT $document_root;
-      fastcgi_param HTTP_HOST $host;
-      fastcgi_pass waypoint-app:9000;
-    }
-
-    client_max_body_size 50m;
-  }
-}
-NGINX
-
-  # Caddy HTTP only, no redirects
-  cat > "${STACK_DIR}/Caddyfile" <<CADDY
-{
-  auto_https off
-}
-
-:80 {
-  reverse_proxy waypoint-web:8080
-}
-CADDY
-
-  # Write a COMPLETE .env so DB_PASSWORD is never blank
-  cat > "${STACK_DIR}/.env" <<EOF
-WAYPOINT_APP_IMAGE=${WAYPOINT_APP_IMAGE}
-
-APP_ENV=${APP_ENV}
-APP_DEBUG=${APP_DEBUG}
-APP_URL=${APP_URL}
-APP_KEY=
-
-DB_CONNECTION=${DB_CONNECTION}
-DB_HOST=${DB_HOST}
-DB_PORT=${DB_PORT}
-DB_DATABASE=${DB_DATABASE}
-DB_USERNAME=${DB_USERNAME}
-DB_PASSWORD=${DB_PASSWORD}
-MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
-
-REDIS_HOST=${REDIS_HOST}
-REDIS_PORT=${REDIS_PORT}
-REDIS_CLIENT=${REDIS_CLIENT}
-
-CACHE_DRIVER=${CACHE_DRIVER}
-QUEUE_CONNECTION=${QUEUE_CONNECTION}
-SESSION_DRIVER=${SESSION_DRIVER}
-
-CADDY_EMAIL=
-CADDY_DOMAIN=${CADDY_DOMAIN}
-TLS_MODE=http
-
-TENANT_ID=${TENANT_ID}
-TENANT_NAME=${TENANT_NAME}
-TENANT_SUBDOMAIN=${TENANT_SUBDOMAIN}
-TENANT_BASE_DOMAIN=${TENANT_BASE_DOMAIN}
-EOF
+  # Keep whatever CADDY_EMAIL is in the template unless empty in template, in which case leave blank.
+  # But always set the domain to the tenant domain.
+  set_env_key "CADDY_DOMAIN" "${CADDY_DOMAIN}"
 
   chmod 600 "${STACK_DIR}/.env"
 }
@@ -516,6 +414,8 @@ main() {
   install_docker
   ensure_compose
   ensure_dirs
+
+  fetch_templates
 
   prompt_inputs
   show_plan_and_confirm
